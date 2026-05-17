@@ -495,9 +495,9 @@ impl Core {
                 let _ = self.send_to_radio(payload).await;
             }
             0x02 | 0x03 => {
-                // Broadcast outgoing message to all connected clients,
+                // Broadcast outgoing message to all other clients,
                 // then forward to the physical radio.
-                let _ = self.broadcast_tx.send(payload.to_vec());
+                self.broadcast_to_others(Some(&cmd.client_id), payload);
                 let _ = self.send_to_radio(payload).await;
             }
             _ => {
@@ -510,6 +510,18 @@ impl Core {
         let client_tx = self.client_channels.lock().unwrap().get(client_id).cloned();
         if let Some(tx) = client_tx {
             let _ = tx.send(payload);
+        }
+    }
+
+    fn broadcast_to_others(&self, exclude: Option<&ClientId>, payload: &[u8]) {
+        let channels = self.client_channels.lock().unwrap();
+        for (id, tx) in channels.iter() {
+            if let Some(exclude_id) = exclude
+                && id == exclude_id
+            {
+                continue;
+            }
+            let _ = tx.send(payload.to_vec());
         }
     }
 

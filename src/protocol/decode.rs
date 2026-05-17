@@ -110,13 +110,15 @@ pub fn decode_command_payload(code: u8, payload: &[u8]) -> Option<HashMap<String
                 DecodedValue::Integer(payload[1] as i64),
             );
         }
-        0x20 if payload.len() > 33 => {
+        0x20 if payload.len() > 49 => {
             let idx = payload[1];
             let name = String::from_utf8_lossy(&payload[2..34])
                 .trim_end_matches('\0')
                 .to_string();
+            let psk = hex::encode(&payload[34..50]);
             map.insert("channel_idx".into(), DecodedValue::Integer(idx as i64));
             map.insert("name".into(), DecodedValue::String(name));
+            map.insert("psk".into(), DecodedValue::String(psk));
         }
         0x25 if payload.len() >= 5 => {
             let pin = u32::from_le_bytes(payload[1..5].try_into().unwrap());
