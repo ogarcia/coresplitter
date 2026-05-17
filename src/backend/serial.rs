@@ -5,6 +5,7 @@ use tokio::task::JoinHandle;
 use tokio_serial::SerialPortBuilderExt;
 
 use super::RadioIo;
+use crate::protocol::frame::Frame;
 
 pub async fn connect(path: &str, baud: u32) -> Result<RadioIo> {
     let mut serial = tokio_serial::new(path, baud)
@@ -25,6 +26,7 @@ pub async fn connect(path: &str, baud: u32) -> Result<RadioIo> {
 
         let read_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
+            let mut parser = crate::protocol::frame::FrameParser::new();
             loop {
                 match reader.read(&mut buf).await {
                     Ok(0) => {
@@ -32,10 +34,12 @@ pub async fn connect(path: &str, baud: u32) -> Result<RadioIo> {
                         break;
                     }
                     Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        tracing::trace!(len = n, "serial: received data");
-                        if recv_tx.send(data).is_err() {
-                            break;
+                        let frames = parser.feed(&buf[..n]);
+                        for payload in frames {
+                            tracing::trace!(len = payload.len(), "serial: received frame");
+                            if recv_tx.send(payload).is_err() {
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -48,7 +52,8 @@ pub async fn connect(path: &str, baud: u32) -> Result<RadioIo> {
 
         let write_handle = tokio::spawn(async move {
             while let Some(data) = send_rx.recv().await {
-                if let Err(e) = writer.write_all(&data).await {
+                let framed = Frame::encode_command(&data);
+                if let Err(e) = writer.write_all(&framed).await {
                     tracing::error!(error = %e, "serial: write error");
                     break;
                 }
@@ -56,7 +61,7 @@ pub async fn connect(path: &str, baud: u32) -> Result<RadioIo> {
                     tracing::error!(error = %e, "serial: flush error");
                     break;
                 }
-                tracing::trace!(len = data.len(), "serial: sent data");
+                tracing::trace!(len = framed.len(), "serial: sent data");
             }
         });
 
