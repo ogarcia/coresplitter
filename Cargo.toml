@@ -1,0 +1,27 @@
+[package]
+name = "coresplitter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-serial = "5"
+btleplug = "0.11"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+thiserror = "2"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+# Bundle SQLite (no system dep required)
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
