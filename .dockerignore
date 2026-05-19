@@ -1,0 +1,8 @@
+target/
+.git/
+.gitattributes
+.gitignore
+*.md
+AGENTS.md
+.github/
+tools/
