@@ -106,6 +106,20 @@ class Client:
                 return p
         return None
 
+    async def send_msg(self, dst: bytes, text: str, ts: int | None = None):
+        if ts is None:
+            ts = int(time.time())
+        payload = b"\x02\x00\x00" + struct.pack("<I", ts) + dst[:6].ljust(6, b"\x00") + text.encode()
+        await self.send(payload)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5:
+            p = await self.recv(1)
+            if p is None:
+                return None
+            if len(p) and p[0] == 0x06:
+                return p
+        return None
+
     async def send_chan_msg(self, channel: int, text: str, ts: int | None = None):
         if ts is None:
             ts = int(time.time())
@@ -432,9 +446,44 @@ async def test_long_message(proxy_port):
     await c.close()
 
 
+async def test_send_contact_msg(proxy_port):
+    log.info("--- Test 9: Envío de mensaje a contacto (0x02) ---")
+    c = await connect_client(port=proxy_port)
+    r = await c.appstart()
+    if not r:
+        fail("SELF_INFO falló")
+        await c.close()
+        return
+
+    dst = bytes.fromhex("aabbccddeeff")
+    r = await c.send_msg(dst, "Hello contacto")
+    if not r:
+        fail("SEND_MSG no devolvió MSG_SENT")
+        await c.close()
+        return
+    ok("SEND_MSG → MSG_SENT (0x06)")
+
+    t0 = time.monotonic()
+    got_echo = False
+    while time.monotonic() - t0 < 6:
+        p = await c.recv(2)
+        if p is None or len(p) == 0:
+            continue
+        if p[0] == 0x07 and b"Hello contacto" in p:
+            got_echo = True
+            break
+
+    if got_echo:
+        ok("CONTACT_MSG_RECV (0x07) echo recibido con texto correcto")
+    else:
+        fail("no se recibió eco 0x07 con el texto esperado")
+
+    await c.close()
+
+
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
-    log.info("--- Test 9: Desconexión TCP + reconexión ---")
+    log.info("--- Test 10: Desconexión TCP + reconexión ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -567,6 +616,7 @@ async def main():
     await test_get_message_polling(proxy_port)
     await test_multiple_messages_order(proxy_port)
     await test_long_message(proxy_port)
+    await test_send_contact_msg(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL

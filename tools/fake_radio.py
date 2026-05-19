@@ -395,12 +395,12 @@ class FakeRadio:
 
             case 0x02:
                 w.write(respond_msg_sent())
-                if self.inject and len(rest) > 6:
-                    from_key = rest[1:7] if len(rest) > 6 else b"\xAA" * 6
-                    txt = rest[7:].decode("utf-8", errors="replace") if len(rest) > 7 else ""
+                if self.inject and len(rest) > 12:
+                    dst = rest[6:12]
+                    txt = rest[12:].decode("utf-8", errors="replace")
                     if txt:
                         asyncio.create_task(self._delayed_inject(
-                            w, make_chan_msg(0, f"echo: {txt}"), 0.5
+                            w, make_contact_msg(dst, f"echo: {txt}"), 0.5
                         ))
                 await w.drain()
 
