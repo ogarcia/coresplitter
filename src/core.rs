@@ -622,7 +622,7 @@ impl Core {
             c.push(contact.contact_type as u8);
             c.push(0);
             c.push(0);
-            c.extend_from_slice(&[0u8; 64]);
+            c.extend_from_slice(&[0u8; 65]);
             let mut name_b = [0u8; 32];
             let nlen = contact.name.len().min(32);
             name_b[..nlen].copy_from_slice(&contact.name.as_bytes()[..nlen]);
@@ -900,6 +900,12 @@ impl Core {
     }
 }
 
+fn sanitize(msg: &str) -> String {
+    msg.chars()
+        .filter(|&c| c.is_ascii_graphic() || c == ' ')
+        .collect()
+}
+
 fn build_event_msg(
     arrow: &str,
     type_name: &str,
@@ -922,7 +928,7 @@ fn build_event_msg(
         use std::fmt::Write;
         let _ = write!(msg, " [{} bytes]: {}", payload.len(), hex::encode(payload));
     }
-    msg
+    sanitize(&msg)
 }
 
 fn build_appstart() -> Vec<u8> {
