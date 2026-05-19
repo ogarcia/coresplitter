@@ -332,7 +332,7 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
             if payload.len() > 60 {
                 map.insert(
                     "max_contacts".into(),
-                    DecodedValue::Integer((payload[2] * 2) as i64),
+                    DecodedValue::Integer((payload[2] as u16 * 2) as i64),
                 );
                 map.insert(
                     "max_channels".into(),

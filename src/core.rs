@@ -885,22 +885,44 @@ impl Core {
             };
 
             if let Ok(json) = serde_json::to_string(&event) {
-                println!("{json}");
+                tracing::info!("{json}");
             }
         } else {
-            print!("{arrow} {type_name}");
-            if let Some(ref d) = decoded {
-                let formatted = format_decoded(d);
-                if !formatted.is_empty() {
-                    print!(": {formatted}");
-                }
-            }
-            if self.config.event_log_level == LogLevel::Verbose {
-                print!(" [{} bytes]: {}", payload.len(), hex::encode(payload));
-            }
-            println!();
+            let msg = build_event_msg(
+                arrow,
+                &type_name,
+                decoded.as_ref(),
+                payload,
+                self.config.event_log_level,
+            );
+            tracing::info!("{msg}");
         }
     }
+}
+
+fn build_event_msg(
+    arrow: &str,
+    type_name: &str,
+    decoded: Option<&HashMap<String, DecodedValue>>,
+    payload: &[u8],
+    level: LogLevel,
+) -> String {
+    let mut msg = String::with_capacity(64 + payload.len() * 2);
+    msg.push_str(arrow);
+    msg.push(' ');
+    msg.push_str(type_name);
+    if let Some(d) = decoded {
+        let formatted = format_decoded(d);
+        if !formatted.is_empty() {
+            msg.push_str(": ");
+            msg.push_str(&formatted);
+        }
+    }
+    if level == LogLevel::Verbose {
+        use std::fmt::Write;
+        let _ = write!(msg, " [{} bytes]: {}", payload.len(), hex::encode(payload));
+    }
+    msg
 }
 
 fn build_appstart() -> Vec<u8> {
