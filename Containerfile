@@ -18,6 +18,7 @@ FROM rust:1-alpine3.23 AS builder
 
 # musl-dev pulls in the C toolchain bits libsqlite3-sys needs to
 # bundle SQLite; the rest of the stack is pure Rust.
+# NOTE: add `dbus-dev` here if building with --features ble.
 RUN apk add --no-cache musl-dev
 
 WORKDIR /app

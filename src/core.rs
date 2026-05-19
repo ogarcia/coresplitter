@@ -193,6 +193,9 @@ impl Core {
                     .as_ref()
                     .context("BLE address not specified")?;
                 tracing::info!(addr = %addr, "connecting to radio via BLE");
+                #[cfg(not(feature = "ble"))]
+                anyhow::bail!("BLE support not compiled (rebuild with --features ble)");
+                #[cfg(feature = "ble")]
                 backend::ble::connect(addr, &self.config.ble_pin).await?
             }
             BackendType::Tcp => {

@@ -34,11 +34,33 @@ same state as the physical radio — the proxy acts as a **faithful mirror**.
 
 ## Build
 
+The default build excludes BLE support to avoid pulling in system
+dependencies (`dbus-1` headers):
+
 ```bash
 cargo build --release
 ```
 
 The binary is at `target/release/coresplitter`.
+
+### BLE support
+
+BLE is behind the optional `ble` feature and requires `dbus-1`
+development headers:
+
+```bash
+# Debian / Ubuntu
+sudo apt install libdbus-1-dev pkg-config
+cargo build --release --features ble
+
+# Alpine
+apk add dbus-dev
+cargo build --release --features ble
+
+# Fedora
+sudo dnf install dbus-devel pkgconf-pkg-config
+cargo build --release --features ble
+```
 
 ## Usage
 
@@ -63,8 +85,10 @@ cargo run --release -- \
 
 ### BLE backend (requires Bluetooth hardware)
 
+Requires building with `--features ble` (see [BLE support](#ble-support)):
+
 ```bash
-cargo run --release -- \
+cargo run --release --features ble -- \
   --ble 00:11:22:33:44:55 \
   --ble-pin 123456
 ```

@@ -1,3 +1,4 @@
+#[cfg(feature = "ble")]
 pub mod ble;
 pub mod serial;
 pub mod tcp;

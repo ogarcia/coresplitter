@@ -1,12 +1,27 @@
 [package]
 name = "coresplitter"
 version = "0.1.0"
+authors = ["Óscar García Amor"]
+license = "GPL-3.0"
+readme = "README.md"
+repository = "https://github.com/ogarcia/coresplitter"
+documentation = "https://github.com/ogarcia/coresplitter"
+homepage = "https://github.com/ogarcia/coresplitter"
+description = """
+Virtual node proxy for MeshCore
+"""
+keywords = ["lesspass", "sqlite", "database", "api", "server"]
+include = ["src/", "LICENSE", "README.md"]
 edition = "2024"
+
+[features]
+default = []
+ble = ["btleplug"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-serial = "5"
-btleplug = "0.11"
+btleplug = { version = "0.11", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
