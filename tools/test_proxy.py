@@ -204,11 +204,10 @@ async def test_multi_client(proxy_port):
     await c1.send_chan_msg(0, "Multi-client test")
 
     # MSG_SENT is consumed by send_chan_msg's drain loop.
-    # c1 will then receive the CHANNEL_MSG_RECV echo via broadcast (expected).
     ok("c1 envió mensaje (MSG_SENT consumido por drain)")
 
-    # c2 should receive CHANNEL_MSG_RECV echo
-    got_echo = False
+    # c2 should receive the raw SEND_CHAN_MSG payload via broadcast_to_others
+    got_broadcast = False
     t0 = time.monotonic()
     while time.monotonic() - t0 < 5:
         p = await c2.recv(2)
@@ -216,14 +215,14 @@ async def test_multi_client(proxy_port):
             break
         if len(p) == 0:
             continue
-        if p[0] == 0x08:
-            got_echo = True
+        if p[0] == 0x03 and b"Multi-client test" in p:
+            got_broadcast = True
             break
 
-    if got_echo:
-        ok("c2 recibe CHANNEL_MSG_RECV (0x08) echo del mensaje")
+    if got_broadcast:
+        ok("c2 recibe SEND_CHAN_MSG (0x03) vía broadcast_to_others")
     else:
-        fail("c2 no recibe echo")
+        fail("c2 no recibe el broadcast del mensaje")
 
     await c1.close()
     await c2.close()
@@ -414,71 +413,80 @@ async def test_multiple_messages_order(proxy_port):
 
 async def test_long_message(proxy_port):
     log.info("--- Test 8: Mensaje largo (>133 caracteres) ---")
-    c = await connect_client(port=proxy_port)
-    r = await c.appstart()
-    if not r:
+    c1 = await connect_client(port=proxy_port)
+    c2 = await connect_client(port=proxy_port)
+    r1 = await c1.appstart()
+    r2 = await c2.appstart()
+    if not r1 or not r2:
         fail("SELF_INFO falló")
-        await c.close()
+        await c1.close()
+        await c2.close()
         return
 
     long_text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."
     assert len(long_text) > 133
 
-    await c.send_chan_msg(0, long_text)
+    await c1.send_chan_msg(0, long_text)
 
     t0 = time.monotonic()
     received = False
     while time.monotonic() - t0 < 6:
-        p = await c.recv(2)
+        p = await c2.recv(2)
         if p is None or len(p) == 0:
             continue
-        if p[0] == 0x08 and len(p) > 6:
-            txt_rx = p[6:].decode("utf-8", errors="replace")
+        if p[0] == 0x03:
+            txt_rx = p[6:].decode("utf-8", errors="replace") if len(p) > 6 else ""
             if "Lorem" in txt_rx or len(txt_rx) > 100:
                 received = True
                 break
 
     if received:
-        ok(f"Broadcast 0x08 con texto largo ({len(txt_rx)} chars)")
+        ok(f"c2 recibe broadcast 0x03 con texto largo ({len(txt_rx)} chars)")
     else:
-        fail("no se recibió mensaje largo en 6s")
+        fail("c2 no recibió broadcast del mensaje largo en 6s")
 
-    await c.close()
+    await c1.close()
+    await c2.close()
 
 
 async def test_send_contact_msg(proxy_port):
     log.info("--- Test 9: Envío de mensaje a contacto (0x02) ---")
-    c = await connect_client(port=proxy_port)
-    r = await c.appstart()
-    if not r:
+    c1 = await connect_client(port=proxy_port)
+    c2 = await connect_client(port=proxy_port)
+    r1 = await c1.appstart()
+    r2 = await c2.appstart()
+    if not r1 or not r2:
         fail("SELF_INFO falló")
-        await c.close()
+        await c1.close()
+        await c2.close()
         return
 
     dst = bytes.fromhex("aabbccddeeff")
-    r = await c.send_msg(dst, "Hello contacto")
+    r = await c1.send_msg(dst, "Hello contacto")
     if not r:
         fail("SEND_MSG no devolvió MSG_SENT")
-        await c.close()
+        await c1.close()
+        await c2.close()
         return
-    ok("SEND_MSG → MSG_SENT (0x06)")
+    ok("c1: SEND_MSG → MSG_SENT (0x06)")
 
     t0 = time.monotonic()
-    got_echo = False
+    got_broadcast = False
     while time.monotonic() - t0 < 6:
-        p = await c.recv(2)
+        p = await c2.recv(2)
         if p is None or len(p) == 0:
             continue
-        if p[0] == 0x07 and b"Hello contacto" in p:
-            got_echo = True
+        if p[0] == 0x02 and b"Hello contacto" in p:
+            got_broadcast = True
             break
 
-    if got_echo:
-        ok("CONTACT_MSG_RECV (0x07) echo recibido con texto correcto")
+    if got_broadcast:
+        ok("c2 recibe SEND_MSG (0x02) vía broadcast_to_others con texto correcto")
     else:
-        fail("no se recibió eco 0x07 con el texto esperado")
+        fail("c2 no recibió 0x02 broadcast con el texto esperado")
 
-    await c.close()
+    await c1.close()
+    await c2.close()
 
 
 async def test_reconnect_tcp(proxy_port):
