@@ -96,6 +96,8 @@ async fn handle_client(
     let client_id = ClientId::new();
     tracing::info!(client = %client_id, addr = %addr, "client connected");
 
+    let _ = stream.set_nodelay(true);
+
     let (mut reader, mut writer) = stream.into_split();
     let mut parser = FrameParser::new();
 
@@ -133,6 +135,12 @@ async fn handle_client(
     let write_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
+                Some(payload) = direct_rx.recv() => {
+                    let framed = Frame::encode_response(&payload);
+                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &framed).await.is_err() {
+                        break;
+                    }
+                }
                 result = broadcast_rx.recv() => {
                     match result {
                         Ok(payload) => {
@@ -143,12 +151,6 @@ async fn handle_client(
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
-                    }
-                }
-                Some(payload) = direct_rx.recv() => {
-                    let framed = Frame::encode_response(&payload);
-                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &framed).await.is_err() {
-                        break;
                     }
                 }
             }

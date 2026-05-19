@@ -622,18 +622,19 @@ impl Core {
             c.push(contact.contact_type as u8);
             c.push(0);
             c.push(0);
-            c.extend_from_slice(&[0u8; 65]);
+            c.extend_from_slice(&[0u8; 64]);
             let mut name_b = [0u8; 32];
             let nlen = contact.name.len().min(32);
             name_b[..nlen].copy_from_slice(&contact.name.as_bytes()[..nlen]);
             c.extend_from_slice(&name_b);
-
+            c.push(0); // field between name and last_advert
             let last_advert = contact.last_advert.unwrap_or(now as i64) as u32;
             c.extend_from_slice(&u32::to_le_bytes(last_advert));
             let lat_i = (contact.lat.unwrap_or(0.0) * 1_000_000.0) as i32;
             let lon_i = (contact.lon.unwrap_or(0.0) * 1_000_000.0) as i32;
             c.extend_from_slice(&i32::to_le_bytes(lat_i));
             c.extend_from_slice(&i32::to_le_bytes(lon_i));
+            c.extend_from_slice(&[0u8; 3]); // trailing bytes
 
             self.send_to_client(client_id, c);
         }
@@ -653,6 +654,7 @@ impl Core {
         let nlen = channel.name.len().min(32);
         name_b[..nlen].copy_from_slice(&channel.name.as_bytes()[..nlen]);
         payload.extend_from_slice(&name_b);
+        payload.extend_from_slice(&[0u8; 16]); // secret placeholder
         self.send_to_client(client_id, payload);
     }
 
@@ -671,12 +673,13 @@ impl Core {
 
     async fn cache_response(&mut self, code: u8, payload: &[u8]) {
         match code {
-            0x03 if payload.len() >= 145 => {
+            0x03 if payload.len() >= 148 => {
                 let pk = payload[1..33].to_vec();
                 let contact_type = payload[33] as i64;
-                let name = String::from_utf8_lossy(&payload[101..133])
-                    .trim_end_matches('\0')
-                    .to_string();
+                let name = String::from_utf8_lossy(
+                    &payload[100..][..payload[100..].iter().position(|&b| b == 0).unwrap_or(32)],
+                )
+                .to_string();
                 let last_advert =
                     u32::from_le_bytes(payload[133..137].try_into().unwrap_or([0; 4])) as i64;
                 let lat = f64::from(i32::from_le_bytes(
@@ -796,9 +799,8 @@ impl Core {
             }
             0x12 if payload.len() >= 34 => {
                 let idx = payload[1] as i64;
-                let name = String::from_utf8_lossy(&payload[2..34])
-                    .trim_end_matches('\0')
-                    .to_string();
+                let name_end = payload[2..34].iter().position(|&b| b == 0).unwrap_or(32);
+                let name = String::from_utf8_lossy(&payload[2..2 + name_end]).to_string();
                 if let Err(e) = self
                     .state
                     .upsert_channel(&CachedChannel {

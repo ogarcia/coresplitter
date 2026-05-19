@@ -181,14 +181,15 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
             let count = u32::from_le_bytes(payload[1..5].try_into().unwrap());
             map.insert("contact_count".into(), DecodedValue::Integer(count as i64));
         }
-        0x03 if payload.len() >= 111 => {
+        0x03 if payload.len() >= 148 => {
             let pk = hex::encode(&payload[1..33]);
             let contact_type = payload[33];
             let _flags = payload[34];
             let path_len = payload[35] as i64;
-            let name = String::from_utf8_lossy(&payload[101..133])
-                .trim_end_matches('\0')
-                .to_string();
+            let name = String::from_utf8_lossy(
+                &payload[100..][..payload[100..].iter().position(|&b| b == 0).unwrap_or(32)],
+            )
+            .to_string();
             let last_advert = u32::from_le_bytes(payload[133..137].try_into().unwrap());
             let lat =
                 f64::from(i32::from_le_bytes(payload[137..141].try_into().unwrap())) / 1_000_000.0;
@@ -350,9 +351,8 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
         }
         0x12 if payload.len() > 2 => {
             let idx = payload[1];
-            let name = String::from_utf8_lossy(&payload[2..34])
-                .trim_end_matches('\0')
-                .to_string();
+            let name_end = payload[2..34].iter().position(|&b| b == 0).unwrap_or(32);
+            let name = String::from_utf8_lossy(&payload[2..2 + name_end]).to_string();
             map.insert("channel_idx".into(), DecodedValue::Integer(idx as i64));
             map.insert("name".into(), DecodedValue::String(name));
         }
