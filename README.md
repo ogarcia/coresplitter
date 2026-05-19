@@ -8,14 +8,15 @@ same state as the physical radio — the proxy acts as a **faithful mirror**.
 ## How it works
 
 ```
-┌──────────┐  TCP     ┌──────────────┐  TCP/serial/BLE  ┌───────────┐
-│ Client   │◄────────►│ CoreSplitter │◄────────────────►│ Physical  │
-│ A        │  0x3c/3e  │  (proxy)     │    meshcore       │ Radio     │
-├──────────┤           │              │                   │(Heltec V3)│
-│ Client   │           │  ┌─────────┐ │                   └───────────┘
-│ B        │           │  │ SQLite  │ │
-└──────────┘           │  │ cache   │ │
-                       │  └─────────┘ │
+┌────────┐             ┌────────────────┐                    ┌──────────┐
+│ Client │◄───────────►│  CoreSplitter  │◄──────────────────►│ Physical │
+│ A      │     TCP     │  (proxy)       │   TCP/serial/BLE   │ Radio    │
+├────────┤   0x3c/3e   │                │      meshcore      │ Node     │
+│ Client │             │  ┌──────────┐  │                    │          │
+│ B      │             │  │  SQLite  │  │                    │          │
+└────────┘             │  │  cache   │  │                    │          │
+                       │  └──────────┘  │                    │          │
+                       └────────────────┘                    └──────────┘
 ```
 
 1. Proxy connects to the physical radio and syncs contacts/channels to SQLite
