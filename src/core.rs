@@ -533,7 +533,10 @@ impl Core {
         payload.extend_from_slice(&self.identity.public_key);
         payload.extend_from_slice(&[0u8; 4]);
         payload.extend_from_slice(&[0u8; 4]);
-        payload.extend_from_slice(&[0u8; 8]);
+        payload.push(0); // multi_acks
+        payload.push(0); // adv_loc_policy
+        payload.push(0); // telemetry_mode
+        payload.push(0); // manual_add_contacts
         payload.extend_from_slice(&u32::to_le_bytes(868_000));
         payload.extend_from_slice(&u32::to_le_bytes(125_000));
         payload.push(12);
