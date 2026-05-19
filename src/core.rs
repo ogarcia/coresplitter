@@ -589,7 +589,7 @@ impl Core {
             let model = info
                 .get("model")
                 .map(|s| s.as_bytes())
-                .unwrap_or(b"CoreSplitter Virtual Node");
+                .unwrap_or(b"Core Splitter Virtual Node");
             let mut model_b = [0u8; 40];
             let mlen = model.len().min(40);
             model_b[..mlen].copy_from_slice(&model[..mlen]);

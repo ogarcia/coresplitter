@@ -1,4 +1,4 @@
-# CoreSplitter
+# Core Splitter
 
 Virtual node proxy for [MeshCore](https://meshcore.io). Connects to a physical
 radio (serial, BLE, or TCP), syncs contacts and channels into SQLite, and
@@ -9,7 +9,7 @@ same state as the physical radio — the proxy acts as a **faithful mirror**.
 
 ```
 ┌────────┐             ┌────────────────┐                    ┌──────────┐
-│ Client │◄───────────►│  CoreSplitter  │◄──────────────────►│ Physical │
+│ Client │◄───────────►│  Core Splitter │◄──────────────────►│ Physical │
 │ A      │     TCP     │  (proxy)       │   TCP/serial/BLE   │ Radio    │
 ├────────┤   0x3c/3e   │                │      meshcore      │ Node     │
 │ Client │             │  ┌──────────┐  │                    │          │
