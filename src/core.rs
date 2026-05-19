@@ -75,6 +75,7 @@ impl Core {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(256);
+
         let (_, dummy_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         Ok(Self {
@@ -101,6 +102,18 @@ impl Core {
             "starting coresplitter virtual node"
         );
 
+        if let Err(e) = self.connect_backend().await {
+            tracing::warn!(error = %e, "initial radio connection failed, will retry");
+            self.reconnect_radio().await;
+        } else if let Err(e) = self.initialize_radio().await {
+            tracing::warn!(error = %e, "initial radio initialization failed, will retry");
+            self.radio_send_tx = None;
+            self.reconnect_radio().await;
+        }
+
+        // Sync state from the physical radio (contacts, channels, etc.)
+        self.sync_from_radio().await;
+
         let frontend_addr = format!(
             "{}:{}",
             self.config.tcp_frontend_host, self.config.tcp_frontend_port
@@ -118,18 +131,6 @@ impl Core {
                 tracing::error!(error = %e, "TCP frontend error");
             }
         });
-
-        if let Err(e) = self.connect_backend().await {
-            tracing::warn!(error = %e, "initial radio connection failed, will retry");
-            self.reconnect_radio().await;
-        } else if let Err(e) = self.initialize_radio().await {
-            tracing::warn!(error = %e, "initial radio initialization failed, will retry");
-            self.radio_send_tx = None;
-            self.reconnect_radio().await;
-        }
-
-        // Sync state from the physical radio (contacts, channels, etc.)
-        self.sync_from_radio().await;
 
         tracing::info!("virtual node ready, accepting clients");
 
@@ -498,6 +499,12 @@ impl Core {
                 // Broadcast outgoing message to all other clients,
                 // then forward to the physical radio.
                 self.broadcast_to_others(Some(&cmd.client_id), payload);
+                let _ = self.send_to_radio(payload).await;
+            }
+            0x20 if payload.len() > 1 => {
+                // Invalidate cached channel so next GET_CHANNEL hits the radio
+                let idx = payload[1] as i64;
+                let _ = self.state.delete_channel(idx).await;
                 let _ = self.send_to_radio(payload).await;
             }
             _ => {

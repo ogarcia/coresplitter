@@ -148,6 +148,14 @@ impl NodeState {
         Ok(())
     }
 
+    pub async fn delete_channel(&self, idx: i64) -> Result<()> {
+        sqlx::query("DELETE FROM channels WHERE idx = ?1")
+            .bind(idx)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_channels(&self) -> Result<Vec<CachedChannel>> {
         let rows = sqlx::query_as::<_, CachedChannel>("SELECT * FROM channels ORDER BY idx")
             .fetch_all(&self.pool)
