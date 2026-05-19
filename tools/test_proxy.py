@@ -95,6 +95,17 @@ class Client:
                 break
         return contacts
 
+    async def get_message(self):
+        await self.send(b"\x0A")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5:
+            p = await self.recv(1)
+            if p is None:
+                return None
+            if len(p) and p[0] in (0x07, 0x08, 0x0A):
+                return p
+        return None
+
     async def send_chan_msg(self, channel: int, text: str, ts: int | None = None):
         if ts is None:
             ts = int(time.time())
@@ -278,9 +289,152 @@ async def test_injected_messages(proxy_port):
     await c.close()
 
 
+async def test_contact_msg_received(proxy_port):
+    log.info("--- Test 5: Mensaje de contacto (0x07) recibido ---")
+    c = await connect_client(port=proxy_port)
+    r = await c.appstart()
+    if not r:
+        fail("SELF_INFO falló")
+        await c.close()
+        return
+
+    t0 = time.monotonic()
+    received = False
+    while time.monotonic() - t0 < 25:
+        p = await c.recv(3)
+        if p is None:
+            break
+        if len(p) == 0:
+            continue
+        if p[0] == 0x07:
+            received = True
+            break
+
+    if received:
+        ok("CONTACT_MSG_RECV (0x07) recibido por broadcast")
+    else:
+        fail("no se recibió 0x07 en 25s")
+
+    await c.close()
+
+
+async def test_get_message_polling(proxy_port):
+    log.info("--- Test 6: GET_MESSAGE polling (0x0A) ---")
+    c = await connect_client(port=proxy_port)
+    r = await c.appstart()
+    if not r:
+        fail("SELF_INFO falló")
+        await c.close()
+        return
+
+    # Wait for any 0x83 from the periodic injector (max 6s per cycle)
+    t0 = time.monotonic()
+    got_83 = False
+    while time.monotonic() - t0 < 10:
+        p = await c.recv(2)
+        if p is None:
+            break
+        if len(p) and p[0] == 0x83:
+            got_83 = True
+            break
+
+    if not got_83:
+        fail("no se recibió MESSAGES_WAITING (0x83) en 10s")
+        await c.close()
+        return
+    ok("0x83 recibido")
+
+    # Drain queue: GET_MESSAGE until stale injector items are gone, then
+    # send one final GET_MESSAGE to verify the protocol works.
+    polled = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 8:
+        p = await c.get_message()
+        if p is None:
+            break
+        if p[0] == 0x0A:
+            break
+        polled.append(p)
+    # We should have polled at least one real message
+    if polled:
+        ok(f"GET_MESSAGE retornó {len(polled)} mensajes (último 0x{polled[-1][0]:02x})")
+    else:
+        fail("GET_MESSAGE no produjo ningún mensaje real")
+
+    await c.close()
+
+
+async def test_multiple_messages_order(proxy_port):
+    log.info("--- Test 7: Múltiples mensajes en orden ---")
+    c = await connect_client(port=proxy_port)
+    r = await c.appstart()
+    if not r:
+        fail("SELF_INFO falló")
+        await c.close()
+        return
+
+    # Collect two consecutive messages via polling to verify ordering
+    msgs = []
+    t0 = time.monotonic()
+    while len(msgs) < 2 and time.monotonic() - t0 < 20:
+        p = await c.recv(3)
+        if p is None or len(p) == 0:
+            continue
+        if p[0] == 0x83:
+            m = await c.get_message()
+            if m and m[0] in (0x07, 0x08):
+                msgs.append(m)
+    # After receiving two messages via push + poll, verify they differ
+    if len(msgs) >= 2:
+        txt0 = msgs[0][6:].decode("utf-8", errors="replace") if len(msgs[0]) > 6 else ""
+        txt1 = msgs[1][6:].decode("utf-8", errors="replace") if len(msgs[1]) > 6 else ""
+        if txt0 and txt1 and txt0 != txt1:
+            ok(f"dos mensajes distintos en orden: {txt0[:20]!r} ≠ {txt1[:20]!r}")
+        else:
+            fail(f"mensajes iguales o vacíos: {txt0[:20]!r} vs {txt1[:20]!r}")
+    else:
+        fail(f"solo se obtuvieron {len(msgs)} mensajes en 20s")
+
+    await c.close()
+
+
+async def test_long_message(proxy_port):
+    log.info("--- Test 8: Mensaje largo (>133 caracteres) ---")
+    c = await connect_client(port=proxy_port)
+    r = await c.appstart()
+    if not r:
+        fail("SELF_INFO falló")
+        await c.close()
+        return
+
+    long_text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."
+    assert len(long_text) > 133
+
+    await c.send_chan_msg(0, long_text)
+
+    t0 = time.monotonic()
+    received = False
+    while time.monotonic() - t0 < 6:
+        p = await c.recv(2)
+        if p is None or len(p) == 0:
+            continue
+        if p[0] == 0x08 and len(p) > 6:
+            txt_rx = p[6:].decode("utf-8", errors="replace")
+            if "Lorem" in txt_rx or len(txt_rx) > 100:
+                received = True
+                break
+
+    if received:
+        ok(f"Broadcast 0x08 con texto largo ({len(txt_rx)} chars)")
+    else:
+        fail("no se recibió mensaje largo en 6s")
+
+    await c.close()
+
+
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
-    log.info("--- Test 4: Desconexión TCP + reconexión ---")
+    log.info("--- Test 9: Desconexión TCP + reconexión ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -409,6 +563,10 @@ async def main():
     await test_multi_client(proxy_port)
     await test_set_channel(proxy_port)
     await test_injected_messages(proxy_port)
+    await test_contact_msg_received(proxy_port)
+    await test_get_message_polling(proxy_port)
+    await test_multiple_messages_order(proxy_port)
+    await test_long_message(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL

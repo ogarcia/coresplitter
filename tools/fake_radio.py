@@ -235,10 +235,43 @@ class SerialWriter:
 # Fake Radio
 # ---------------------------------------------------------------------------
 
+def make_contact_msg(from_key: bytes, text: str) -> bytes:
+    payload = bytearray()
+    payload.append(0x07)
+    payload.extend(from_key[:6].ljust(6, b"\x00"))
+    payload.append(0)
+    payload.append(1)
+    payload.extend(struct.pack("<I", int(time.time())))
+    payload.extend(text.encode("utf-8"))
+    return encode_response(bytes(payload))
+
+
+def make_messages_waiting() -> bytes:
+    return encode_response(b"\x83")
+
+
 class FakeRadio:
     def __init__(self, inject: bool = False):
         self.channels: list[dict] = list(DEFAULT_CHANNELS)
         self.inject = inject
+        # Per-writer message queues (writer fd/id → list of framed messages)
+        self._msg_queues: dict[int, list[bytes]] = {}
+        self._next_queue_id = 0
+
+    def _queue_for_writer(self, w) -> int:
+        qid = id(w)
+        if qid not in self._msg_queues:
+            self._msg_queues[qid] = []
+        return qid
+
+    def _push_msg(self, w, framed: bytes):
+        qid = self._queue_for_writer(w)
+        self._msg_queues[qid].append(framed)
+
+    def _pop_msg(self, w) -> bytes | None:
+        qid = self._queue_for_writer(w)
+        q = self._msg_queues[qid]
+        return q.pop(0) if q else None
 
     # -- TCP handler -------------------------------------------------------
 
@@ -404,7 +437,11 @@ class FakeRadio:
                 await w.drain()
 
             case 0x0A:
-                w.write(encode_response(b"\x0A"))
+                msg = self._pop_msg(w)
+                if msg is not None:
+                    w.write(msg)
+                else:
+                    w.write(encode_response(b"\x0A"))
                 await w.drain()
 
             case 0x0B:
@@ -471,27 +508,35 @@ class FakeRadio:
     # -- Injection helpers -------------------------------------------------
 
     async def _injector(self, w):
-        texts = [
-            "Keep alive from fake radio",
-            "Test message on Public",
-            "Alerta: temperatura alta",
+        items: list[bytes] = [
+            make_chan_msg(0, "Keep alive from fake radio"),
+            make_contact_msg(b"\xAA\xBB\xCC\xDD\xEE\xFF", "Hello from Alpha"),
+            make_chan_msg(0, "Test message on Public"),
+            make_chan_msg(0, "Alerta: temperatura alta"),
+            make_chan_msg(0, "A" * 200),
         ]
         try:
             n = 0
             while True:
-                await asyncio.sleep(12)
-                if n < len(texts):
-                    msg = make_chan_msg(0, texts[n])
-                    w.write(msg)
-                    await w.drain()
-                    print(f"  <- INJECT ChanMsg: {texts[n]!r}")
-                    n += 1
+                await asyncio.sleep(6)
+                if n >= len(items):
+                    n = 0
+                framed = items[n]
+                w.write(framed)
+                self._push_msg(w, framed)
+                w.write(make_messages_waiting())
+                await w.drain()
+                print(f"  <- INJECT item[{n}]: {framed[3:10].hex()}...")
+                n += 1
         except asyncio.CancelledError:
             pass
 
     async def _delayed_inject(self, w, msg: bytes, delay: float):
         await asyncio.sleep(delay)
         try:
+            # Push to GET_MESSAGE queue
+            self._push_msg(w, msg)
+            # Send as direct push for broadcast/caching
             w.write(msg)
             await w.drain()
             print(f"  <- INJECT (delayed): {msg[3:10].hex()}")
