@@ -97,18 +97,20 @@ cargo run --release --features ble -- \
 ### Environment variables
 
 | Variable | Description |
-|---|---|
-| `SERIAL_PORT` | Serial port path |
-| `BAUD_RATE` | Baud rate (default: 115200) |
-| `BLE_ADDRESS` | BLE device address |
-| `TCP_BACKEND_HOST` | Radio TCP host |
-| `TCP_BACKEND_PORT` | Backend TCP port (default: 5000) |
-| `TCP_FRONTEND_HOST` | Frontend TCP bind (default: 0.0.0.0) |
-| `TCP_FRONTEND_PORT` | Frontend TCP port (default: 5000) |
-| `NODE_NAME` | Virtual node name (defaults to physical radio's name) |
-| `DATA_DIR` | Data directory (default: ./data) |
-| `LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
-| `LOG_JSON` | Enable JSON event logging |
+|---|---|---|
+| `CORESPLITTER_SERIAL_PORT` | Serial port path |
+| `CORESPLITTER_BAUD_RATE` | Baud rate (default: 115200) |
+| `CORESPLITTER_BLE_ADDRESS` | BLE device address |
+| `CORESPLITTER_BLE_PIN` | BLE pairing PIN (default: 123456) |
+| `CORESPLITTER_TCP_BACKEND_HOST` | Radio TCP host |
+| `CORESPLITTER_TCP_BACKEND_PORT` | Backend TCP port (default: 5000) |
+| `CORESPLITTER_TCP_FRONTEND_HOST` | Frontend TCP bind (default: 0.0.0.0) |
+| `CORESPLITTER_TCP_FRONTEND_PORT` | Frontend TCP port (default: 5000) |
+| `CORESPLITTER_NODE_NAME` | Virtual node name (defaults to physical radio's name) |
+| `CORESPLITTER_DATA_DIR` | Data directory (default: ./data) |
+| `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
+| `CORESPLITTER_LOG_JSON` | Enable JSON event logging |
+| `CORESPLITTER_RECORD_RADIO_RX` | Record all raw radio RX to database |
 
 ## Test suite
 

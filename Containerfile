@@ -48,6 +48,6 @@ WORKDIR /var/lib/coresplitter
 
 EXPOSE 5000
 
-ENV DATA_DIR=/var/lib/coresplitter
+ENV CORESPLITTER_DATA_DIR=/var/lib/coresplitter
 
 ENTRYPOINT ["/usr/bin/coresplitter"]

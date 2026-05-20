@@ -8,52 +8,65 @@ use crate::core::{BackendType, CoreConfig, LogLevel};
 #[command(name = "coresplitter", version, about = "MeshCore virtual node proxy")]
 pub struct Cli {
     /// Serial port path (e.g., /dev/ttyUSB0)
-    #[arg(long, short = 's', env = "SERIAL_PORT")]
+    #[arg(long, short = 's', env = "CORESPLITTER_SERIAL_PORT")]
     pub serial: Option<String>,
 
     /// Serial baud rate
-    #[arg(long, default_value = "115200", env = "BAUD_RATE")]
+    #[arg(long, default_value = "115200", env = "CORESPLITTER_BAUD_RATE")]
     pub baud: u32,
 
     /// BLE device address (MAC or UUID)
-    #[arg(long, short = 'b', env = "BLE_ADDRESS")]
+    #[arg(long, short = 'b', env = "CORESPLITTER_BLE_ADDRESS")]
     pub ble: Option<String>,
 
     /// BLE pairing PIN
-    #[arg(long, default_value = "123456", env = "BLE_PIN")]
+    #[arg(long, default_value = "123456", env = "CORESPLITTER_BLE_PIN")]
     pub ble_pin: String,
 
     /// TCP backend host (connect to remote radio/proxy)
-    #[arg(long, short = 't', env = "TCP_BACKEND_HOST")]
+    #[arg(long, short = 't', env = "CORESPLITTER_TCP_BACKEND_HOST")]
     pub tcp_backend_host: Option<String>,
 
     /// TCP backend port
-    #[arg(long, short = 'p', default_value = "5000", env = "TCP_BACKEND_PORT")]
+    #[arg(
+        long,
+        short = 'p',
+        default_value = "5000",
+        env = "CORESPLITTER_TCP_BACKEND_PORT"
+    )]
     pub tcp_backend_port: Option<u16>,
 
     /// TCP frontend bind address
-    #[arg(long, default_value = "0.0.0.0", env = "TCP_FRONTEND_HOST")]
+    #[arg(
+        long,
+        default_value = "0.0.0.0",
+        env = "CORESPLITTER_TCP_FRONTEND_HOST"
+    )]
     pub tcp_frontend_host: String,
 
     /// TCP frontend port
-    #[arg(long, default_value_t = 5000, env = "TCP_FRONTEND_PORT")]
+    #[arg(long, default_value_t = 5000, env = "CORESPLITTER_TCP_FRONTEND_PORT")]
     pub tcp_frontend_port: u16,
 
     /// Node name (sent in SELF_INFO; defaults to the real radio's name)
-    #[arg(long, default_value = "", env = "NODE_NAME")]
+    #[arg(long, default_value = "", env = "CORESPLITTER_NODE_NAME")]
     pub node_name: String,
 
     /// Data directory for identity keys and state database
-    #[arg(long, default_value = "./data", env = "DATA_DIR")]
+    #[arg(long, default_value = "./data", env = "CORESPLITTER_DATA_DIR")]
     pub data_dir: PathBuf,
 
     /// Log level: off, error, warn, info, debug, verbose
-    #[arg(long, default_value = "info", env = "LOG_LEVEL")]
+    #[arg(long, default_value = "info", env = "CORESPLITTER_LOG_LEVEL")]
     pub log_level: String,
 
     /// JSON event logging
-    #[arg(long, env = "LOG_JSON")]
+    #[arg(long, env = "CORESPLITTER_LOG_JSON")]
     pub json: bool,
+
+    /// Record all raw radio RX payloads into the raw_rx database table
+    #[arg(long, env = "CORESPLITTER_RECORD_RADIO_RX")]
+    pub record_radio_rx: bool,
 }
 
 impl Cli {
@@ -89,6 +102,7 @@ impl Cli {
             node_name: self.node_name,
             event_log_level,
             event_log_json: self.json,
+            record_radio_rx: self.record_radio_rx,
         }
     }
 }

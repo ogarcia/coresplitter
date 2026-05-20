@@ -101,6 +101,17 @@ impl NodeState {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS raw_rx (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                code INTEGER NOT NULL,
+                payload BLOB NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -213,5 +224,18 @@ impl NodeState {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| r.get(0)))
+    }
+
+    // --- Raw RX recording ---
+
+    pub async fn insert_raw_rx(&self, code: u8, payload: &[u8]) -> Result<()> {
+        let ts = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO raw_rx (ts, code, payload) VALUES (?1, ?2, ?3)")
+            .bind(ts)
+            .bind(code as i64)
+            .bind(payload)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }

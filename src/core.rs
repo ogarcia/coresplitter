@@ -35,6 +35,7 @@ pub struct CoreConfig {
     pub node_name: String,
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
+    pub record_radio_rx: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,6 +692,10 @@ impl Core {
         self.log_event("<-", resp_code, &payload);
 
         self.cache_response(resp_code, &payload).await;
+
+        if self.config.record_radio_rx {
+            let _ = self.state.insert_raw_rx(resp_code, &payload).await;
+        }
 
         let _ = self.broadcast_tx.send(payload);
     }
