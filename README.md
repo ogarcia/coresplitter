@@ -97,7 +97,7 @@ cargo run --release --features ble -- \
 ### Environment variables
 
 | Variable | Description |
-|---|---|---|
+|---|---|
 | `CORESPLITTER_SERIAL_PORT` | Serial port path |
 | `CORESPLITTER_BAUD_RATE` | Baud rate (default: 115200) |
 | `CORESPLITTER_BLE_ADDRESS` | BLE device address |
