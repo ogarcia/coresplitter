@@ -48,6 +48,7 @@ pub enum CommandCode {
     SendControlData = 0x37,
     GetStats = 0x38,
     RequestAdvert = 0x39,
+    HasConnection = 0x40,
 }
 
 impl CommandCode {
@@ -98,6 +99,7 @@ impl CommandCode {
             0x37 => Some(Self::SendControlData),
             0x38 => Some(Self::GetStats),
             0x39 => Some(Self::RequestAdvert),
+            0x40 => Some(Self::HasConnection),
             _ => None,
         }
     }
@@ -151,6 +153,7 @@ impl fmt::Display for CommandCode {
             Self::SendControlData => "CMD_SEND_CONTROL_DATA",
             Self::GetStats => "CMD_GET_STATS",
             Self::RequestAdvert => "CMD_REQUEST_ADVERT",
+            Self::HasConnection => "CMD_HAS_CONNECTION",
         };
         write!(f, "{name}")
     }

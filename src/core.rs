@@ -653,7 +653,12 @@ impl Core {
         let nlen = channel.name.len().min(32);
         name_b[..nlen].copy_from_slice(&channel.name.as_bytes()[..nlen]);
         payload.extend_from_slice(&name_b);
-        payload.extend_from_slice(&[0u8; 16]); // secret placeholder
+        let mut secret_b = [0u8; 16];
+        if let Some(ref secret) = channel.config {
+            let slen = secret.len().min(16);
+            secret_b[..slen].copy_from_slice(&secret[..slen]);
+        }
+        payload.extend_from_slice(&secret_b);
         self.send_to_client(client_id, payload);
     }
 
@@ -796,16 +801,17 @@ impl Core {
                     }
                 }
             }
-            0x12 if payload.len() >= 34 => {
+            0x12 if payload.len() >= 50 => {
                 let idx = payload[1] as i64;
                 let name_end = payload[2..34].iter().position(|&b| b == 0).unwrap_or(32);
                 let name = String::from_utf8_lossy(&payload[2..2 + name_end]).to_string();
+                let secret = payload[34..50].to_vec();
                 if let Err(e) = self
                     .state
                     .upsert_channel(&CachedChannel {
                         idx,
                         name,
-                        config: None,
+                        config: Some(secret),
                     })
                     .await
                 {

@@ -153,12 +153,14 @@ def respond_device_info() -> bytes:
     return encode_response(bytes(payload))
 
 
-def respond_channel_info(idx: int, name: str) -> bytes:
+def respond_channel_info(idx: int, name: str, psk: bytes = b"\x00" * 16) -> bytes:
     payload = bytearray()
     payload.append(0x12)
     payload.append(idx)
     name_b = name.encode("utf-8")[:32].ljust(32, b"\x00")
     payload.extend(name_b)
+    secret = psk[:16].ljust(16, b"\x00")
+    payload.extend(secret)
     return encode_response(bytes(payload))
 
 
@@ -459,7 +461,7 @@ class FakeRadio:
                 idx = rest[0] if rest else 0
                 ch = next((c for c in self.channels if c["idx"] == idx), None)
                 if ch:
-                    w.write(respond_channel_info(idx, ch["name"]))
+                    w.write(respond_channel_info(idx, ch["name"], ch["psk"]))
                 else:
                     w.write(respond_channel_info(idx, ""))
                 await w.drain()
