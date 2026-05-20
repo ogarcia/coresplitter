@@ -189,12 +189,12 @@ async def test_multi_client(proxy_port):
 
     r1 = await c1.appstart()
     if r1 is None:
-        fail(f"c1 SELF_INFO falló (recibió: {await c1.recv(200)})")
+        fail(f"c1 SELF_INFO failed (got: {await c1.recv(200)})")
     r2 = await c2.appstart()
     if r2 is None:
-        fail(f"c2 SELF_INFO falló (recibió: {await c2.recv(200)})")
+        fail(f"c2 SELF_INFO failed (got: {await c2.recv(200)})")
     if r1 and r2:
-        ok("ambos clients reciben SELF_INFO")
+        ok("both clients receive SELF_INFO")
     else:
         await c1.close()
         await c2.close()
@@ -204,9 +204,9 @@ async def test_multi_client(proxy_port):
     await c1.send_chan_msg(0, "Multi-client test")
 
     # MSG_SENT is consumed by send_chan_msg's drain loop.
-    ok("c1 envió mensaje (MSG_SENT consumido por drain)")
+    ok("c1 sent message (MSG_SENT consumed by drain)")
 
-    # c2 should receive the raw SEND_CHAN_MSG payload via broadcast_to_others
+    # c2 should receive a synthesized CHANNEL_MSG_RECV (0x08) via broadcast
     got_broadcast = False
     t0 = time.monotonic()
     while time.monotonic() - t0 < 5:
@@ -215,25 +215,25 @@ async def test_multi_client(proxy_port):
             break
         if len(p) == 0:
             continue
-        if p[0] == 0x03 and b"Multi-client test" in p:
+        if p[0] == 0x08 and b"Multi-client test" in p:
             got_broadcast = True
             break
 
     if got_broadcast:
-        ok("c2 recibe SEND_CHAN_MSG (0x03) vía broadcast_to_others")
+        ok("c2 receives CHANNEL_MSG_RECV (0x08) via broadcast_to_others")
     else:
-        fail("c2 no recibe el broadcast del mensaje")
+        fail("c2 did not receive broadcast message")
 
     await c1.close()
     await c2.close()
 
 
 async def test_set_channel(proxy_port):
-    log.info("--- Test 2: SET_CHANNEL + persistencia ---")
+    log.info("--- Test 2: SET_CHANNEL + persistence ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
-        fail("SELF_INFO falló")
+        fail("SELF_INFO failed")
         await c.close()
         return
 
@@ -241,7 +241,7 @@ async def test_set_channel(proxy_port):
     if r:
         ok("SET_CHANNEL → ACK (0x00)")
     else:
-        fail("SET_CHANNEL no recibió ACK")
+        fail("SET_CHANNEL did not receive ACK")
         await c.close()
         return
 
@@ -251,12 +251,12 @@ async def test_set_channel(proxy_port):
         if name == "TestChannel":
             ok("GET_CHANNEL(5) → 'TestChannel'")
         else:
-            fail(f"GET_CHANNEL(5) esperaba 'TestChannel', recibió {name!r}")
+            fail(f"GET_CHANNEL(5) expected 'TestChannel', got {name!r}")
     else:
-        fail(f"GET_CHANNEL(5) falló: {r.hex() if r else 'None'}")
+            fail(f"GET_CHANNEL(5) failed: {r.hex() if r else 'None'}")
 
     # Reconnect and verify persistence
-    log.info("  Reconectando para persistencia...")
+    log.info("  Reconnecting for persistence...")
     await c.close()
     c = await connect_client(port=proxy_port)
     await c.appstart()
@@ -264,21 +264,21 @@ async def test_set_channel(proxy_port):
     if r and r[0] == 0x12:
         name = r[2:34].rstrip(b"\x00").decode("utf-8", "replace")
         if name == "TestChannel":
-            ok("persistencia SQLite: GET_CHANNEL(5) → 'TestChannel' tras reconectar")
+            ok("SQLite persistence: GET_CHANNEL(5) → 'TestChannel' after reconnect")
         else:
-            fail(f"persistencia falló: {name!r}")
+            fail(f"persistence failed: {name!r}")
     else:
-        fail("persistencia: GET_CHANNEL falló")
+        fail("persistence: GET_CHANNEL failed")
 
     await c.close()
 
 
 async def test_injected_messages(proxy_port):
-    log.info("--- Test 3: Mensajes injectados (CHANNEL_MSG_RECV) ---")
+    log.info("--- Test 3: Injected messages (CHANNEL_MSG_RECV) ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
-        fail("SELF_INFO falló")
+        fail("SELF_INFO failed")
         await c.close()
         return
 
@@ -295,19 +295,19 @@ async def test_injected_messages(proxy_port):
             break
 
     if received:
-        ok("CHANNEL_MSG_RECV recibido por broadcast")
+        ok("CHANNEL_MSG_RECV received via broadcast")
     else:
-        fail("no se recibió CHANNEL_MSG_RECV en 25s")
+        fail("did not receive CHANNEL_MSG_RECV in 25s")
 
     await c.close()
 
 
 async def test_contact_msg_received(proxy_port):
-    log.info("--- Test 5: Mensaje de contacto (0x07) recibido ---")
+    log.info("--- Test 5: Contact message (0x07) received ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
-        fail("SELF_INFO falló")
+        fail("SELF_INFO failed")
         await c.close()
         return
 
@@ -324,9 +324,9 @@ async def test_contact_msg_received(proxy_port):
             break
 
     if received:
-        ok("CONTACT_MSG_RECV (0x07) recibido por broadcast")
+        ok("CONTACT_MSG_RECV (0x07) received via broadcast")
     else:
-        fail("no se recibió 0x07 en 25s")
+        fail("did not receive 0x07 in 25s")
 
     await c.close()
 
@@ -336,7 +336,7 @@ async def test_get_message_polling(proxy_port):
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
-        fail("SELF_INFO falló")
+        fail("SELF_INFO failed")
         await c.close()
         return
 
@@ -352,10 +352,10 @@ async def test_get_message_polling(proxy_port):
             break
 
     if not got_83:
-        fail("no se recibió MESSAGES_WAITING (0x83) en 10s")
+        fail("did not receive MESSAGES_WAITING (0x83) in 10s")
         await c.close()
         return
-    ok("0x83 recibido")
+    ok("0x83 received")
 
     # Drain queue: GET_MESSAGE until stale injector items are gone, then
     # send one final GET_MESSAGE to verify the protocol works.
@@ -370,19 +370,19 @@ async def test_get_message_polling(proxy_port):
         polled.append(p)
     # We should have polled at least one real message
     if polled:
-        ok(f"GET_MESSAGE retornó {len(polled)} mensajes (último 0x{polled[-1][0]:02x})")
+        ok(f"GET_MESSAGE returned {len(polled)} messages (last 0x{polled[-1][0]:02x})")
     else:
-        fail("GET_MESSAGE no produjo ningún mensaje real")
+        fail("GET_MESSAGE did not produce any real messages")
 
     await c.close()
 
 
 async def test_multiple_messages_order(proxy_port):
-    log.info("--- Test 7: Múltiples mensajes en orden ---")
+    log.info("--- Test 7: Multiple messages in order ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
-        fail("SELF_INFO falló")
+        fail("SELF_INFO failed")
         await c.close()
         return
 
@@ -402,23 +402,23 @@ async def test_multiple_messages_order(proxy_port):
         txt0 = msgs[0][6:].decode("utf-8", errors="replace") if len(msgs[0]) > 6 else ""
         txt1 = msgs[1][6:].decode("utf-8", errors="replace") if len(msgs[1]) > 6 else ""
         if txt0 and txt1 and txt0 != txt1:
-            ok(f"dos mensajes distintos en orden: {txt0[:20]!r} ≠ {txt1[:20]!r}")
+            ok(f"two distinct messages in order: {txt0[:20]!r} ≠ {txt1[:20]!r}")
         else:
-            fail(f"mensajes iguales o vacíos: {txt0[:20]!r} vs {txt1[:20]!r}")
+            fail(f"messages equal or empty: {txt0[:20]!r} vs {txt1[:20]!r}")
     else:
-        fail(f"solo se obtuvieron {len(msgs)} mensajes en 20s")
+        fail(f"only got {len(msgs)} messages in 20s")
 
     await c.close()
 
 
 async def test_long_message(proxy_port):
-    log.info("--- Test 8: Mensaje largo (>133 caracteres) ---")
+    log.info("--- Test 8: Long message (>133 chars) ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
     r1 = await c1.appstart()
     r2 = await c2.appstart()
     if not r1 or not r2:
-        fail("SELF_INFO falló")
+        fail("SELF_INFO failed")
         await c1.close()
         await c2.close()
         return
@@ -434,37 +434,37 @@ async def test_long_message(proxy_port):
         p = await c2.recv(2)
         if p is None or len(p) == 0:
             continue
-        if p[0] == 0x03:
-            txt_rx = p[6:].decode("utf-8", errors="replace") if len(p) > 6 else ""
+        if p[0] == 0x08:
+            txt_rx = p[8:].decode("utf-8", errors="replace") if len(p) > 8 else ""
             if "Lorem" in txt_rx or len(txt_rx) > 100:
                 received = True
                 break
 
     if received:
-        ok(f"c2 recibe broadcast 0x03 con texto largo ({len(txt_rx)} chars)")
+        ok(f"c2 receives CHANNEL_MSG_RECV (0x08) with long text ({len(txt_rx)} chars)")
     else:
-        fail("c2 no recibió broadcast del mensaje largo en 6s")
+        fail("c2 did not receive long message broadcast in 6s")
 
     await c1.close()
     await c2.close()
 
 
 async def test_send_contact_msg(proxy_port):
-    log.info("--- Test 9: Envío de mensaje a contacto (0x02) ---")
+    log.info("--- Test 9: Send contact message (0x02) ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
     r1 = await c1.appstart()
     r2 = await c2.appstart()
     if not r1 or not r2:
-        fail("SELF_INFO falló")
+        fail("SELF_INFO failed")
         await c1.close()
         await c2.close()
         return
 
     dst = bytes.fromhex("aabbccddeeff")
-    r = await c1.send_msg(dst, "Hello contacto")
+    r = await c1.send_msg(dst, "Hello contact")
     if not r:
-        fail("SEND_MSG no devolvió MSG_SENT")
+        fail("SEND_MSG did not return MSG_SENT")
         await c1.close()
         await c2.close()
         return
@@ -476,14 +476,14 @@ async def test_send_contact_msg(proxy_port):
         p = await c2.recv(2)
         if p is None or len(p) == 0:
             continue
-        if p[0] == 0x02 and b"Hello contacto" in p:
+        if p[0] == 0x07 and b"Hello contact" in p:
             got_broadcast = True
             break
 
     if got_broadcast:
-        ok("c2 recibe SEND_MSG (0x02) vía broadcast_to_others con texto correcto")
+        ok("c2 receives CONTACT_MSG_RECV (0x07) via broadcast_to_others with correct text")
     else:
-        fail("c2 no recibió 0x02 broadcast con el texto esperado")
+        fail("c2 did not receive 0x07 broadcast with expected text")
 
     await c1.close()
     await c2.close()
@@ -491,17 +491,17 @@ async def test_send_contact_msg(proxy_port):
 
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
-    log.info("--- Test 10: Desconexión TCP + reconexión ---")
+    log.info("--- Test 10: TCP disconnection + reconnection ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
-        fail("SELF_INFO falló")
+        fail("SELF_INFO failed")
         await c.close()
         return
 
     # Kill fake radio
     if fake_proc and fake_proc.returncode is None:
-        log.info("  Matando fake radio (PID=%d)...", fake_pid)
+        log.info("  Killing fake radio (PID=%d)...", fake_pid)
         fake_proc.terminate()
         try:
             await asyncio.wait_for(fake_proc.wait(), timeout=5)
@@ -510,13 +510,13 @@ async def test_reconnect_tcp(proxy_port):
     fake_proc = None
 
     await asyncio.sleep(4)
-    log.info("  Proxy debería estar reconectando...")
+    log.info("  Proxy should be reconnecting...")
 
     # Restart fake radio on the same port (proxy still tries to reconnect to old port)
-    log.info("  Reiniciando fake radio...")
+    log.info("  Restarting fake radio...")
     await start_fake(port=fake_port)
     if not fake_proc:
-        fail("no se pudo reiniciar fake radio")
+        fail("could not restart fake radio")
         await c.close()
         return
 
@@ -528,9 +528,9 @@ async def test_reconnect_tcp(proxy_port):
 
     r = await c.get_channel(0)
     if r and r[0] == 0x12:
-        ok("proxy reconectado y responde GET_CHANNEL tras reconexión")
+        ok("proxy reconnected and responds to GET_CHANNEL after reconnection")
     else:
-        fail(f"proxy no responde tras reconexión (r={r}, raw=...)")
+        fail(f"proxy does not respond after reconnection (r={r}, raw=...)")
 
     await c.close()
 
@@ -586,7 +586,7 @@ async def main():
     proxy_port = await find_free_port()
 
     proxy_bin = os.path.join(
-        os.path.dirname(__file__), "..", "target", "release", "coresplitter"
+        os.path.dirname(__file__), "..", "target", "debug", "coresplitter"
     )
     proxy_proc = await asyncio.create_subprocess_exec(
         proxy_bin,
@@ -630,9 +630,9 @@ async def main():
     total = PASS + FAIL
     log.info("=" * 40)
     if FAIL == 0:
-        log.info("RESULTADO: %d/%d PASS", PASS, total)
+        log.info("RESULT: %d/%d PASS", PASS, total)
     else:
-        log.error("RESULTADO: %d/%d PASS, %d FAIL", PASS, total, FAIL)
+        log.error("RESULT: %d/%d PASS, %d FAIL", PASS, total, FAIL)
 
     if proxy_proc:
         proxy_proc.terminate()
