@@ -379,29 +379,51 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
     if map.is_empty() { None } else { Some(map) }
 }
 
+fn format_entry(k: &str, v: &DecodedValue) -> String {
+    let val_str = match v {
+        DecodedValue::String(s) => s.clone(),
+        DecodedValue::Integer(i) => i.to_string(),
+        DecodedValue::Float(f) => format!("{f:.2}"),
+        DecodedValue::Bool(b) => b.to_string(),
+        DecodedValue::Bytes(b) => hex::encode(b),
+        DecodedValue::Map(m) => {
+            let inner: Vec<String> = m.iter().map(|(ik, iv)| format!("{ik}={iv}")).collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+    };
+    format!("{k}={val_str}")
+}
+
+fn should_skip(v: &DecodedValue) -> bool {
+    match v {
+        DecodedValue::Float(f) => *f == 0.0,
+        _ => false,
+    }
+}
+
 pub fn format_decoded(map: &HashMap<String, DecodedValue>) -> String {
-    let parts: Vec<String> = map
-        .iter()
-        .filter(|(_, v)| match v {
-            DecodedValue::Float(f) => *f != 0.0,
-            _ => true,
-        })
-        .map(|(k, v)| {
-            let val_str = match v {
-                DecodedValue::String(s) => s.clone(),
-                DecodedValue::Integer(i) => i.to_string(),
-                DecodedValue::Float(f) => format!("{f:.2}"),
-                DecodedValue::Bool(b) => b.to_string(),
-                DecodedValue::Bytes(b) => hex::encode(b),
-                DecodedValue::Map(m) => {
-                    let inner: Vec<String> =
-                        m.iter().map(|(ik, iv)| format!("{ik}={iv}")).collect();
-                    format!("{{{}}}", inner.join(", "))
-                }
-            };
-            format!("{k}={val_str}")
-        })
-        .collect();
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+
+    let mut parts: Vec<String> = Vec::with_capacity(keys.len());
+
+    // name first if present
+    if let Some(v) = map.get("name")
+        && !should_skip(v)
+    {
+        parts.push(format_entry("name", v));
+    }
+
+    for k in keys {
+        if *k == "name" {
+            continue;
+        }
+        let v = &map[k];
+        if should_skip(v) {
+            continue;
+        }
+        parts.push(format_entry(k, v));
+    }
 
     parts.join(" | ")
 }
