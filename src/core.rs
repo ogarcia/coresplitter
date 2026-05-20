@@ -620,21 +620,20 @@ impl Core {
             pk_b[..pklen].copy_from_slice(&contact.public_key[..pklen]);
             c.extend_from_slice(&pk_b);
             c.push(contact.contact_type as u8);
-            c.push(0);
-            c.push(0);
-            c.extend_from_slice(&[0u8; 64]);
+            c.push(0); // flags
+            c.push(0); // path_len
+            c.extend_from_slice(&[0u8; 64]); // path
             let mut name_b = [0u8; 32];
             let nlen = contact.name.len().min(32);
             name_b[..nlen].copy_from_slice(&contact.name.as_bytes()[..nlen]);
             c.extend_from_slice(&name_b);
-            c.push(0); // field between name and last_advert
             let last_advert = contact.last_advert.unwrap_or(now as i64) as u32;
             c.extend_from_slice(&u32::to_le_bytes(last_advert));
             let lat_i = (contact.lat.unwrap_or(0.0) * 1_000_000.0) as i32;
             let lon_i = (contact.lon.unwrap_or(0.0) * 1_000_000.0) as i32;
             c.extend_from_slice(&i32::to_le_bytes(lat_i));
             c.extend_from_slice(&i32::to_le_bytes(lon_i));
-            c.extend_from_slice(&[0u8; 3]); // trailing bytes
+            c.extend_from_slice(&[0u8; 4]); // last_mod
 
             self.send_to_client(client_id, c);
         }
@@ -681,12 +680,12 @@ impl Core {
                 )
                 .to_string();
                 let last_advert =
-                    u32::from_le_bytes(payload[133..137].try_into().unwrap_or([0; 4])) as i64;
+                    u32::from_le_bytes(payload[132..136].try_into().unwrap_or([0; 4])) as i64;
                 let lat = f64::from(i32::from_le_bytes(
-                    payload[137..141].try_into().unwrap_or([0; 4]),
+                    payload[136..140].try_into().unwrap_or([0; 4]),
                 )) / 1_000_000.0;
                 let lon = f64::from(i32::from_le_bytes(
-                    payload[141..145].try_into().unwrap_or([0; 4]),
+                    payload[140..144].try_into().unwrap_or([0; 4]),
                 )) / 1_000_000.0;
 
                 if let Err(e) = self

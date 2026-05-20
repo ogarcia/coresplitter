@@ -124,16 +124,15 @@ def respond_contacts() -> list[bytes]:
         entry.append(0x03)
         entry.extend(c["key"])
         entry.append(c["type"])
-        entry.append(0)
-        entry.append(0)
-        entry.extend(b"\x00" * 64)
+        entry.append(0)  # flags
+        entry.append(0)  # path_len
+        entry.extend(b"\x00" * 64)  # path
         name_b = c["name"].encode("utf-8")[:32].ljust(32, b"\x00")
         entry.extend(name_b)
-        entry.append(0)  # field between name and last_advert
         entry.extend(struct.pack("<I", c["last_advert"]))
         entry.extend(struct.pack("<i", int(c["lat"] * 1_000_000)))
         entry.extend(struct.pack("<i", int(c["lon"] * 1_000_000)))
-        entry.extend(b"\x00" * 3)  # trailing bytes
+        entry.extend(b"\x00" * 4)  # last_mod
         frames.append(encode_response(bytes(entry)))
 
     end = bytearray([0x04])

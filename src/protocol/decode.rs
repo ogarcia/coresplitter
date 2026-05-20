@@ -190,11 +190,11 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
                 &payload[100..][..payload[100..].iter().position(|&b| b == 0).unwrap_or(32)],
             )
             .to_string();
-            let last_advert = u32::from_le_bytes(payload[133..137].try_into().unwrap());
+            let last_advert = u32::from_le_bytes(payload[132..136].try_into().unwrap());
             let lat =
-                f64::from(i32::from_le_bytes(payload[137..141].try_into().unwrap())) / 1_000_000.0;
+                f64::from(i32::from_le_bytes(payload[136..140].try_into().unwrap())) / 1_000_000.0;
             let lon =
-                f64::from(i32::from_le_bytes(payload[141..145].try_into().unwrap())) / 1_000_000.0;
+                f64::from(i32::from_le_bytes(payload[140..144].try_into().unwrap())) / 1_000_000.0;
             let type_name = match contact_type {
                 0 => "node",
                 1 => "repeater",
