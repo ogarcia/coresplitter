@@ -503,6 +503,26 @@ impl Core {
                 // then forward to the physical radio.
                 self.broadcast_to_others(Some(&cmd.client_id), payload);
                 let _ = self.send_to_radio(payload).await;
+
+                // Persist outgoing message so it survives restart even
+                // if the radio does not echo it back.
+                let from_key = &self.identity.public_key[..6];
+                if payload[0] == 0x02 && payload.len() >= 14 {
+                    let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
+                    let text = String::from_utf8_lossy(&payload[13..]).to_string();
+                    let _ = self
+                        .state
+                        .insert_message("contact", Some(from_key), None, &text, ts)
+                        .await;
+                } else if payload[0] == 0x03 && payload.len() >= 8 {
+                    let channel = payload[2] as i64;
+                    let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
+                    let text = String::from_utf8_lossy(&payload[7..]).to_string();
+                    let _ = self
+                        .state
+                        .insert_message("channel", Some(from_key), Some(channel), &text, ts)
+                        .await;
+                }
             }
             0x20 if payload.len() > 1 => {
                 // Invalidate cached channel so next GET_CHANNEL hits the radio
