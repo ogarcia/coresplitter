@@ -821,6 +821,40 @@ impl Core {
                     }
                 }
             }
+            0x10 if payload.len() >= 13 => {
+                let txt_type = payload[11];
+                let from_key = Some(payload[4..10].to_vec());
+                let ts = u32::from_le_bytes(payload[12..16].try_into().unwrap_or([0; 4])) as i64;
+                let text_offset = if txt_type == 2 { 20 } else { 16 };
+                let text = if payload.len() > text_offset {
+                    String::from_utf8_lossy(&payload[text_offset..]).to_string()
+                } else {
+                    String::new()
+                };
+                if let Err(e) = self
+                    .state
+                    .insert_message("contact", from_key.as_deref(), None, &text, ts)
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to cache V3 contact message");
+                }
+            }
+            0x11 if payload.len() >= 11 => {
+                let channel_idx = payload[4] as i64;
+                let ts = u32::from_le_bytes(payload[7..11].try_into().unwrap_or([0; 4])) as i64;
+                let text = if payload.len() > 11 {
+                    String::from_utf8_lossy(&payload[11..]).to_string()
+                } else {
+                    String::new()
+                };
+                if let Err(e) = self
+                    .state
+                    .insert_message("channel", None, Some(channel_idx), &text, ts)
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to cache V3 channel message");
+                }
+            }
             0x12 if payload.len() >= 50 => {
                 let idx = payload[1] as i64;
                 let name_end = payload[2..34].iter().position(|&b| b == 0).unwrap_or(32);

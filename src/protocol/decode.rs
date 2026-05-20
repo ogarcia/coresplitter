@@ -349,6 +349,54 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
                 map.insert("model".into(), DecodedValue::String(model));
             }
         }
+        0x10 if payload.len() >= 13 => {
+            let snr = payload[1] as i8 as f64 / 4.0;
+            let from = hex::encode(&payload[4..10]);
+            let path_len = payload[10] & 0x3f;
+            let txt_type = payload[11];
+            let timestamp = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+            let text_offset = if txt_type == 2 { 20 } else { 16 };
+            let text = if payload.len() > text_offset {
+                String::from_utf8_lossy(&payload[text_offset..]).to_string()
+            } else {
+                String::new()
+            };
+            map.insert("from".into(), DecodedValue::String(from));
+            map.insert("snr".into(), DecodedValue::Float(snr));
+            map.insert("path_len".into(), DecodedValue::Integer(path_len as i64));
+            map.insert("timestamp".into(), DecodedValue::Integer(timestamp as i64));
+            map.insert("text".into(), DecodedValue::String(text));
+            let type_name = match txt_type {
+                0 => "text",
+                1 => "command",
+                2 => "signed",
+                _ => "unknown",
+            };
+            map.insert("type".into(), DecodedValue::String(type_name.into()));
+        }
+        0x11 if payload.len() >= 11 => {
+            let snr = payload[1] as i8 as f64 / 4.0;
+            let channel = payload[4];
+            let path_len = payload[5] & 0x3f;
+            let txt_type = payload[6];
+            let timestamp = u32::from_le_bytes(payload[7..11].try_into().unwrap());
+            let text = if payload.len() > 11 {
+                String::from_utf8_lossy(&payload[11..]).to_string()
+            } else {
+                String::new()
+            };
+            map.insert("channel".into(), DecodedValue::Integer(channel as i64));
+            map.insert("snr".into(), DecodedValue::Float(snr));
+            map.insert("path_len".into(), DecodedValue::Integer(path_len as i64));
+            map.insert("timestamp".into(), DecodedValue::Integer(timestamp as i64));
+            map.insert("text".into(), DecodedValue::String(text));
+            let type_name = match txt_type {
+                0 => "text",
+                1 => "command",
+                _ => "unknown",
+            };
+            map.insert("type".into(), DecodedValue::String(type_name.into()));
+        }
         0x12 if payload.len() > 2 => {
             let idx = payload[1];
             let name_end = payload[2..34].iter().position(|&b| b == 0).unwrap_or(32);
