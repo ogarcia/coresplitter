@@ -226,17 +226,43 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
         0x05 if payload.len() >= 52 => {
             let adv_type = payload[1];
             let tx_power = payload[2];
+            let max_tx_power = payload[3];
+            map.insert(
+                "max_tx_power".into(),
+                DecodedValue::Integer(max_tx_power as i64),
+            );
             let pk = hex::encode(&payload[4..36]);
             let lat =
                 f64::from(i32::from_le_bytes(payload[36..40].try_into().unwrap())) / 1_000_000.0;
             let lon =
                 f64::from(i32::from_le_bytes(payload[40..44].try_into().unwrap())) / 1_000_000.0;
+            map.insert(
+                "multi_acks".into(),
+                DecodedValue::Integer(payload[44] as i64),
+            );
+            map.insert(
+                "adv_loc_policy".into(),
+                DecodedValue::Integer(payload[45] as i64),
+            );
+            map.insert(
+                "telemetry_mode".into(),
+                DecodedValue::Integer(payload[46] as i64),
+            );
+            map.insert(
+                "manual_add_contacts".into(),
+                DecodedValue::Integer(payload[47] as i64),
+            );
             let freq = f64::from(u32::from_le_bytes(payload[48..52].try_into().unwrap())) / 1000.0;
             let bw = if payload.len() >= 56 {
                 f64::from(u32::from_le_bytes(payload[52..56].try_into().unwrap())) / 1000.0
             } else {
                 0.0
             };
+            let has_sf_cr = payload.len() > 57;
+            if has_sf_cr {
+                map.insert("sf".into(), DecodedValue::Integer(payload[56] as i64));
+                map.insert("cr".into(), DecodedValue::Integer(payload[57] as i64));
+            }
             let type_name = match adv_type {
                 0 => "node",
                 1 => "client",
@@ -244,8 +270,9 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
                 3 => "room",
                 _ => "unknown",
             };
-            let name = if payload.len() > 56 {
-                String::from_utf8_lossy(&payload[56..])
+            let name_offset = if has_sf_cr { 58 } else { 56 };
+            let name = if payload.len() > name_offset {
+                String::from_utf8_lossy(&payload[name_offset..])
                     .trim_end_matches('\0')
                     .to_string()
             } else {

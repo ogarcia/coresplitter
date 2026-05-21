@@ -108,6 +108,8 @@ def respond_self_info() -> bytes:
     payload.extend(b"\x00" * 4)
     payload.extend(struct.pack("<I", freq))
     payload.extend(struct.pack("<I", bw))
+    payload.append(12)  # sf
+    payload.append(5)   # cr
     payload.extend(node_name)
     return encode_response(bytes(payload))
 

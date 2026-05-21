@@ -115,6 +115,15 @@ impl Core {
         // Sync state from the physical radio (contacts, channels, etc.)
         self.sync_from_radio().await;
 
+        // Load persisted self_info if not already set (radio offline fallback)
+        if self.self_info.is_none()
+            && let Ok(Some(data)) = self.state.kv_get("self_info").await
+            && let Ok(info) = serde_json::from_slice::<HashMap<String, String>>(&data)
+        {
+            tracing::info!("restored SELF_INFO from kv_store");
+            self.self_info = Some(info);
+        }
+
         let frontend_addr = format!(
             "{}:{}",
             self.config.tcp_frontend_host, self.config.tcp_frontend_port
@@ -332,22 +341,15 @@ impl Core {
                 data = self.radio_recv_rx.recv() => {
                     match data {
                         Some(payload) if !payload.is_empty() && payload[0] == 0x05 => {
-                            if let Some(decoded) = decode_response_payload(payload[0], &payload) {
-                                let mut info = HashMap::new();
-                                if let Some(DecodedValue::String(name)) = decoded.get("name") {
-                                    info.insert("name".into(), name.clone());
-                                    if self.config.node_name.is_empty() {
-                                        self.identity.name = name.clone();
-                                        tracing::info!(name = %name, "adopted real radio node name");
-                                    }
+                            let code = payload[0];
+                            self.cache_response(code, &payload).await;
+                            if let Some(ref info) = self.self_info {
+                                if self.config.node_name.is_empty()
+                                    && let Some(name) = info.get("name")
+                                {
+                                    self.identity.name = name.clone();
+                                    tracing::info!(name = %name, "adopted real radio node name");
                                 }
-                                if let Some(DecodedValue::String(pk)) = decoded.get("public_key") {
-                                    info.insert("public_key".into(), pk.clone());
-                                }
-                                if let Some(DecodedValue::String(ntype)) = decoded.get("type") {
-                                    info.insert("node_type".into(), ntype.clone());
-                                }
-                                self.self_info = Some(info);
                                 tracing::info!("radio initialized, received SELF_INFO");
                                 return Ok(());
                             } else {
@@ -580,20 +582,121 @@ impl Core {
 
     async fn respond_self_info(&self, client_id: &ClientId) {
         let mut payload = vec![0x05];
-        payload.push(1);
-        payload.push(0);
-        payload.push(20);
+
+        let adv_type: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("type"))
+            .map(|t| match t.as_str() {
+                "node" => 0,
+                "repeater" => 2,
+                "room" => 3,
+                _ => 1,
+            })
+            .unwrap_or(1);
+        payload.push(adv_type);
+
+        let tx_power: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("tx_power"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        payload.push(tx_power);
+
+        let max_tx_power: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("max_tx_power"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        payload.push(max_tx_power);
+
         payload.extend_from_slice(&self.identity.public_key);
-        payload.extend_from_slice(&[0u8; 4]);
-        payload.extend_from_slice(&[0u8; 4]);
-        payload.push(0); // multi_acks
-        payload.push(0); // adv_loc_policy
-        payload.push(0); // telemetry_mode
-        payload.push(0); // manual_add_contacts
-        payload.extend_from_slice(&u32::to_le_bytes(868_000));
-        payload.extend_from_slice(&u32::to_le_bytes(125_000));
-        payload.push(12);
-        payload.push(5);
+
+        let lat: f64 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("lat"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let lat_i = (lat * 1_000_000.0) as i32;
+        payload.extend_from_slice(&i32::to_le_bytes(lat_i));
+
+        let lon: f64 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("lon"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let lon_i = (lon * 1_000_000.0) as i32;
+        payload.extend_from_slice(&i32::to_le_bytes(lon_i));
+
+        let multi_acks: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("multi_acks"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        payload.push(multi_acks);
+
+        let adv_loc_policy: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("adv_loc_policy"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        payload.push(adv_loc_policy);
+
+        let telemetry_mode: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("telemetry_mode"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        payload.push(telemetry_mode);
+
+        let manual_add_contacts: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("manual_add_contacts"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        payload.push(manual_add_contacts);
+
+        let freq_khz: u32 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("freq_mhz"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|f| (f * 1000.0) as u32)
+            .unwrap_or(868_000);
+        payload.extend_from_slice(&u32::to_le_bytes(freq_khz));
+
+        let bw_hz: u32 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("bw_khz"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|f| (f * 1000.0) as u32)
+            .unwrap_or(125_000);
+        payload.extend_from_slice(&u32::to_le_bytes(bw_hz));
+
+        let sf: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("sf"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
+        payload.push(sf);
+
+        let cr: u8 = self
+            .self_info
+            .as_ref()
+            .and_then(|i| i.get("cr"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        payload.push(cr);
         payload.extend_from_slice(self.identity.name.as_bytes());
 
         self.send_to_client(client_id, payload);
@@ -758,11 +861,22 @@ impl Core {
             0x05 => {
                 if let Some(decoded) = decode_response_payload(code, payload) {
                     let mut info = HashMap::new();
-                    if let Some(DecodedValue::String(name)) = decoded.get("name") {
-                        info.insert("name".into(), name.clone());
+                    for (k, v) in &decoded {
+                        match v {
+                            DecodedValue::String(s) => {
+                                info.insert(k.clone(), s.clone());
+                            }
+                            DecodedValue::Integer(i) => {
+                                info.insert(k.clone(), i.to_string());
+                            }
+                            DecodedValue::Float(f) => {
+                                info.insert(k.clone(), f.to_string());
+                            }
+                            _ => {}
+                        }
                     }
-                    if let Some(DecodedValue::String(pk)) = decoded.get("public_key") {
-                        info.insert("public_key".into(), pk.clone());
+                    if let Ok(json) = serde_json::to_string(&info) {
+                        let _ = self.state.kv_set("self_info", json.as_bytes()).await;
                     }
                     self.self_info = Some(info);
                 }
