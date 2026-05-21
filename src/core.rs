@@ -115,13 +115,20 @@ impl Core {
         // Sync state from the physical radio (contacts, channels, etc.)
         self.sync_from_radio().await;
 
-        // Load persisted self_info if not already set (radio offline fallback)
+        // Load persisted info from kv_store if not already set (radio offline fallback)
         if self.self_info.is_none()
             && let Ok(Some(data)) = self.state.kv_get("self_info").await
             && let Ok(info) = serde_json::from_slice::<HashMap<String, String>>(&data)
         {
             tracing::info!("restored SELF_INFO from kv_store");
             self.self_info = Some(info);
+        }
+        if self.device_info.is_none()
+            && let Ok(Some(data)) = self.state.kv_get("device_info").await
+            && let Ok(info) = serde_json::from_slice::<HashMap<String, String>>(&data)
+        {
+            tracing::info!("restored DEVICE_INFO from kv_store");
+            self.device_info = Some(info);
         }
 
         let frontend_addr = format!(
@@ -721,7 +728,12 @@ impl Core {
                 .unwrap_or(40);
             payload.push(max_contacts / 2);
             payload.push(max_channels);
-            payload.extend_from_slice(&u32::to_le_bytes(123456));
+
+            let build_number: u32 = info
+                .get("build_number")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            payload.extend_from_slice(&u32::to_le_bytes(build_number));
 
             let build = info
                 .get("fw_build")
@@ -741,7 +753,10 @@ impl Core {
             model_b[..mlen].copy_from_slice(&model[..mlen]);
             payload.extend_from_slice(&model_b);
 
-            let version = b"0.1.0";
+            let version = info
+                .get("version")
+                .map(|s| s.as_bytes())
+                .unwrap_or(b"0.1.0");
             let mut ver_b = [0u8; 20];
             let vlen = version.len().min(20);
             ver_b[..vlen].copy_from_slice(&version[..vlen]);
@@ -897,6 +912,9 @@ impl Core {
                             }
                             _ => {}
                         }
+                    }
+                    if let Ok(json) = serde_json::to_string(&info) {
+                        let _ = self.state.kv_set("device_info", json.as_bytes()).await;
                     }
                     self.device_info = Some(info);
                 }

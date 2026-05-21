@@ -357,7 +357,7 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
         0x0D if payload.len() > 1 => {
             let fw = payload[1];
             map.insert("fw_version".into(), DecodedValue::Integer(fw as i64));
-            if payload.len() > 60 {
+            if payload.len() > 3 {
                 map.insert(
                     "max_contacts".into(),
                     DecodedValue::Integer((payload[2] as u16 * 2) as i64),
@@ -366,14 +366,31 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
                     "max_channels".into(),
                     DecodedValue::Integer(payload[3] as i64),
                 );
+            }
+            if payload.len() >= 8 {
+                let build_num = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                map.insert(
+                    "build_number".into(),
+                    DecodedValue::Integer(build_num as i64),
+                );
+            }
+            if payload.len() >= 20 {
                 let build = String::from_utf8_lossy(&payload[8..20])
                     .trim_end_matches('\0')
                     .to_string();
+                map.insert("fw_build".into(), DecodedValue::String(build));
+            }
+            if payload.len() >= 60 {
                 let model = String::from_utf8_lossy(&payload[20..60])
                     .trim_end_matches('\0')
                     .to_string();
-                map.insert("fw_build".into(), DecodedValue::String(build));
                 map.insert("model".into(), DecodedValue::String(model));
+            }
+            if payload.len() > 80 {
+                let version = String::from_utf8_lossy(&payload[60..80])
+                    .trim_end_matches('\0')
+                    .to_string();
+                map.insert("version".into(), DecodedValue::String(version));
             }
         }
         0x10 if payload.len() >= 13 => {
