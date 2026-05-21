@@ -729,11 +729,11 @@ impl Core {
             payload.push(max_contacts / 2);
             payload.push(max_channels);
 
-            let build_number: u32 = info
-                .get("build_number")
+            let ble_pin: u32 = info
+                .get("ble_pin")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            payload.extend_from_slice(&u32::to_le_bytes(build_number));
+                .unwrap_or(123456);
+            payload.extend_from_slice(&u32::to_le_bytes(ble_pin));
 
             let build = info
                 .get("fw_build")
@@ -761,6 +761,18 @@ impl Core {
             let vlen = version.len().min(20);
             ver_b[..vlen].copy_from_slice(&version[..vlen]);
             payload.extend_from_slice(&ver_b);
+
+            let client_repeat: u8 = info
+                .get("client_repeat")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            payload.push(client_repeat);
+
+            let path_hash_mode: u8 = info
+                .get("path_hash_mode")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            payload.push(path_hash_mode);
         }
 
         self.send_to_client(client_id, payload);

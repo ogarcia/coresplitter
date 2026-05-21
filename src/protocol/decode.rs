@@ -368,11 +368,8 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
                 );
             }
             if payload.len() >= 8 {
-                let build_num = u32::from_le_bytes(payload[4..8].try_into().unwrap());
-                map.insert(
-                    "build_number".into(),
-                    DecodedValue::Integer(build_num as i64),
-                );
+                let ble_pin = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                map.insert("ble_pin".into(), DecodedValue::Integer(ble_pin as i64));
             }
             if payload.len() >= 20 {
                 let build = String::from_utf8_lossy(&payload[8..20])
@@ -391,6 +388,18 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
                     .trim_end_matches('\0')
                     .to_string();
                 map.insert("version".into(), DecodedValue::String(version));
+            }
+            if payload.len() > 81 {
+                map.insert(
+                    "client_repeat".into(),
+                    DecodedValue::Integer(payload[80] as i64),
+                );
+            }
+            if payload.len() > 82 {
+                map.insert(
+                    "path_hash_mode".into(),
+                    DecodedValue::Integer(payload[81] as i64),
+                );
             }
         }
         0x10 if payload.len() >= 13 => {
