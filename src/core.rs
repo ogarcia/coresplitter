@@ -51,6 +51,7 @@ pub struct Core {
     state: Arc<NodeState>,
     self_info: Option<HashMap<String, String>>,
     device_info: Option<HashMap<String, String>>,
+    battery_info: Option<HashMap<String, String>>,
     max_channels: u8,
     radio_send_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     radio_recv_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -85,6 +86,7 @@ impl Core {
             state: Arc::new(state),
             self_info: None,
             device_info: None,
+            battery_info: None,
             max_channels: 40,
             radio_send_tx: None,
             radio_recv_rx: dummy_rx,
@@ -129,6 +131,13 @@ impl Core {
         {
             tracing::info!("restored DEVICE_INFO from kv_store");
             self.device_info = Some(info);
+        }
+        if self.battery_info.is_none()
+            && let Ok(Some(data)) = self.state.kv_get("battery_info").await
+            && let Ok(info) = serde_json::from_slice::<HashMap<String, String>>(&data)
+        {
+            tracing::info!("restored BATTERY from kv_store");
+            self.battery_info = Some(info);
         }
 
         let frontend_addr = format!(
@@ -492,6 +501,13 @@ impl Core {
                 }
                 let _ = self.send_to_radio(payload).await;
             }
+            0x14 => {
+                if let Some(ref info) = self.battery_info.clone() {
+                    self.respond_battery(&cmd.client_id, info).await;
+                } else {
+                    let _ = self.send_to_radio(payload).await;
+                }
+            }
             0x1F => {
                 let requested_idx = if payload.len() > 1 {
                     payload[1] as i64
@@ -778,6 +794,31 @@ impl Core {
         self.send_to_client(client_id, payload);
     }
 
+    async fn respond_battery(&self, client_id: &ClientId, info: &HashMap<String, String>) {
+        let mut payload = vec![0x0C];
+
+        let mv: u16 = info
+            .get("level_mv")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        payload.extend_from_slice(&u16::to_le_bytes(mv));
+
+        let used_kb: u32 = info
+            .get("used_kb")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        payload.extend_from_slice(&u32::to_le_bytes(used_kb));
+
+        let total_kb: u32 = info
+            .get("total_kb")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        payload.extend_from_slice(&u32::to_le_bytes(total_kb));
+
+        self.send_to_client(client_id, payload);
+        tracing::debug!(mv, "responded with BATTERY");
+    }
+
     async fn respond_contacts(&self, client_id: &ClientId, contacts: &[CachedContact]) {
         let count = contacts.len() as u32;
         let now = chrono::Utc::now().timestamp() as u32;
@@ -906,6 +947,29 @@ impl Core {
                         let _ = self.state.kv_set("self_info", json.as_bytes()).await;
                     }
                     self.self_info = Some(info);
+                }
+            }
+            0x0C => {
+                if let Some(decoded) = decode_response_payload(code, payload) {
+                    let mut info = HashMap::new();
+                    for (k, v) in &decoded {
+                        match v {
+                            DecodedValue::String(s) => {
+                                info.insert(k.clone(), s.clone());
+                            }
+                            DecodedValue::Integer(i) => {
+                                info.insert(k.clone(), i.to_string());
+                            }
+                            DecodedValue::Float(f) => {
+                                info.insert(k.clone(), f.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Ok(json) = serde_json::to_string(&info) {
+                        let _ = self.state.kv_set("battery_info", json.as_bytes()).await;
+                    }
+                    self.battery_info = Some(info);
                 }
             }
             0x0D => {
