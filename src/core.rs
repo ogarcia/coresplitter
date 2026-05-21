@@ -579,6 +579,9 @@ impl Core {
                 let _ = self.send_to_radio(payload).await;
             }
             _ => {
+                self.self_info = None;
+                self.device_info = None;
+                self.battery_info = None;
                 let _ = self.send_to_radio(payload).await;
             }
         }
