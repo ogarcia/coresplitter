@@ -8,7 +8,6 @@ use tokio::time::{self, Duration};
 
 use crate::backend;
 use crate::frontend::tcp::{ClientCommand, ClientDirectMap, ClientId, TcpFrontend};
-use crate::node::identity::Identity;
 use crate::node::state::{CachedChannel, CachedContact, NodeState};
 use crate::protocol::decode::{
     DecodedValue, decode_command_payload, decode_response_payload, format_decoded,
@@ -28,11 +27,10 @@ pub struct CoreConfig {
     pub ble_address: Option<String>,
     pub ble_pin: String,
     pub tcp_backend_host: Option<String>,
-    pub tcp_backend_port: Option<u16>,
+    pub tcp_backend_port: u16,
     pub tcp_frontend_host: String,
     pub tcp_frontend_port: u16,
     pub data_dir: PathBuf,
-    pub node_name: String,
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
     pub record_radio_rx: bool,
@@ -47,11 +45,12 @@ pub enum LogLevel {
 
 pub struct Core {
     config: CoreConfig,
-    identity: Identity,
     state: Arc<NodeState>,
-    self_info: Option<HashMap<String, String>>,
-    device_info: Option<HashMap<String, String>>,
-    battery_info: Option<HashMap<String, String>>,
+    self_info_raw: Option<Vec<u8>>,
+    device_info_raw: Option<Vec<u8>>,
+    battery_info_raw: Option<Vec<u8>>,
+    radio_pubkey: Option<[u8; 32]>,
+    radio_name: Option<String>,
     max_channels: u8,
     radio_send_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     radio_recv_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -66,15 +65,6 @@ impl Core {
     pub async fn new(config: CoreConfig, shutdown_rx: watch::Receiver<bool>) -> Result<Self> {
         let state = NodeState::open(config.data_dir.join("state.db")).await?;
 
-        let mut identity = Identity::new(config.node_name.clone());
-        if !identity.load_from_db(&state).await? {
-            identity.generate();
-            identity.save_to_db(&state).await?;
-        }
-        if identity.name.is_empty() {
-            identity.name = "Core Splitter".into();
-        }
-
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(256);
 
@@ -82,11 +72,12 @@ impl Core {
 
         Ok(Self {
             config,
-            identity,
             state: Arc::new(state),
-            self_info: None,
-            device_info: None,
-            battery_info: None,
+            self_info_raw: None,
+            device_info_raw: None,
+            battery_info_raw: None,
+            radio_pubkey: None,
+            radio_name: None,
             max_channels: 40,
             radio_send_tx: None,
             radio_recv_rx: dummy_rx,
@@ -99,11 +90,7 @@ impl Core {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        tracing::info!(
-            node_name = %self.identity.name,
-            pubkey = %hex::encode(&self.identity.public_key[..8]),
-            "starting coresplitter virtual node"
-        );
+        tracing::info!("starting coresplitter (MeshCore client multiplexer + cache)");
 
         if let Err(e) = self.connect_backend().await {
             tracing::warn!(error = %e, "initial radio connection failed, will retry");
@@ -117,27 +104,26 @@ impl Core {
         // Sync state from the physical radio (contacts, channels, etc.)
         self.sync_from_radio().await;
 
-        // Load persisted info from kv_store if not already set (radio offline fallback)
-        if self.self_info.is_none()
-            && let Ok(Some(data)) = self.state.kv_get("self_info").await
-            && let Ok(info) = serde_json::from_slice::<HashMap<String, String>>(&data)
+        // Load persisted blobs from kv_store if not already set (radio offline fallback)
+        if self.self_info_raw.is_none()
+            && let Ok(Some(blob)) = self.state.kv_get("self_info_raw").await
         {
-            tracing::info!("restored SELF_INFO from kv_store");
-            self.self_info = Some(info);
+            tracing::info!("restored SELF_INFO blob from kv_store");
+            self.extract_radio_identity(&blob);
+            self.self_info_raw = Some(blob);
         }
-        if self.device_info.is_none()
-            && let Ok(Some(data)) = self.state.kv_get("device_info").await
-            && let Ok(info) = serde_json::from_slice::<HashMap<String, String>>(&data)
+        if self.device_info_raw.is_none()
+            && let Ok(Some(blob)) = self.state.kv_get("device_info_raw").await
         {
-            tracing::info!("restored DEVICE_INFO from kv_store");
-            self.device_info = Some(info);
+            tracing::info!("restored DEVICE_INFO blob from kv_store");
+            self.extract_max_channels(&blob);
+            self.device_info_raw = Some(blob);
         }
-        if self.battery_info.is_none()
-            && let Ok(Some(data)) = self.state.kv_get("battery_info").await
-            && let Ok(info) = serde_json::from_slice::<HashMap<String, String>>(&data)
+        if self.battery_info_raw.is_none()
+            && let Ok(Some(blob)) = self.state.kv_get("battery_info_raw").await
         {
-            tracing::info!("restored BATTERY from kv_store");
-            self.battery_info = Some(info);
+            tracing::info!("restored BATTERY blob from kv_store");
+            self.battery_info_raw = Some(blob);
         }
 
         let frontend_addr = format!(
@@ -158,7 +144,7 @@ impl Core {
             }
         });
 
-        tracing::info!("virtual node ready, accepting clients");
+        tracing::info!("multiplexer ready, accepting clients");
 
         loop {
             tokio::select! {
@@ -192,7 +178,7 @@ impl Core {
     }
 
     async fn shutdown(&mut self) {
-        tracing::info!("shutting down virtual node");
+        tracing::info!("shutting down multiplexer");
 
         self.radio_send_tx = None;
         let (_, dummy_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -230,10 +216,7 @@ impl Core {
                     .tcp_backend_host
                     .as_ref()
                     .context("TCP backend host not specified")?;
-                let port = self
-                    .config
-                    .tcp_backend_port
-                    .context("TCP backend port not specified")?;
+                let port = self.config.tcp_backend_port;
                 tracing::info!(host = %host, port = %port, "connecting to radio via TCP");
                 backend::tcp::connect(host, port).await?
             }
@@ -357,19 +340,19 @@ impl Core {
                 data = self.radio_recv_rx.recv() => {
                     match data {
                         Some(payload) if !payload.is_empty() && payload[0] == 0x05 => {
-                            let code = payload[0];
-                            self.cache_response(code, &payload).await;
-                            if let Some(ref info) = self.self_info {
-                                if self.config.node_name.is_empty()
-                                    && let Some(name) = info.get("name")
-                                {
-                                    self.identity.name = name.clone();
-                                    tracing::info!(name = %name, "adopted real radio node name");
-                                }
-                                tracing::info!("radio initialized, received SELF_INFO");
+                            self.cache_response(0x05, &payload).await;
+                            if self.self_info_raw.is_some() {
+                                tracing::info!(
+                                    name = self.radio_name.as_deref().unwrap_or("?"),
+                                    pubkey = %self.radio_pubkey
+                                        .as_ref()
+                                        .map(|pk| hex::encode(&pk[..8]))
+                                        .unwrap_or_default(),
+                                    "radio initialized, received SELF_INFO"
+                                );
                                 return Ok(());
                             } else {
-                                anyhow::bail!("failed to decode SELF_INFO");
+                                anyhow::bail!("failed to cache SELF_INFO");
                             }
                         }
                         Some(payload) => {
@@ -404,28 +387,8 @@ impl Core {
                 data = self.radio_recv_rx.recv() => {
                     match data {
                         Some(payload) if !payload.is_empty() && payload[0] == 0x0D => {
-                            if let Some(decoded) = decode_response_payload(0x0D, &payload) {
-                                if let Some(DecodedValue::Integer(n)) = decoded.get("max_channels") {
-                                    let max = (*n).min(255) as u8;
-                                    if max > 0 {
-                                        self.max_channels = max;
-                                    }
-                                    tracing::info!(max_channels = self.max_channels, "radio reports max channels");
-                                }
-                                let mut info = HashMap::new();
-                                for (k, v) in &decoded {
-                                    match v {
-                                        DecodedValue::String(s) => { info.insert(k.clone(), s.clone()); }
-                                        DecodedValue::Integer(i) => { info.insert(k.clone(), i.to_string()); }
-                                        DecodedValue::Float(f) => { info.insert(k.clone(), f.to_string()); }
-                                        _ => {}
-                                    }
-                                }
-                                self.device_info = Some(info);
-                                return Ok(());
-                            } else {
-                                anyhow::bail!("failed to decode DEVICE_INFO");
-                            }
+                            self.cache_response(0x0D, &payload).await;
+                            return Ok(());
                         }
                         Some(payload) if !payload.is_empty() && payload[0] == 0x01 => {
                             tracing::warn!("radio returned error for DEVICE_QUERY, using default max_channels={}", self.max_channels);
@@ -484,10 +447,16 @@ impl Core {
         self.log_event("->", cmd_code, payload);
 
         match cmd_code {
-            0x01 => self.respond_self_info(&cmd.client_id).await,
+            0x01 => {
+                if let Some(ref blob) = self.self_info_raw {
+                    self.send_to_client(&cmd.client_id, blob.clone());
+                } else {
+                    let _ = self.send_to_radio(payload).await;
+                }
+            }
             0x16 => {
-                if let Some(ref info) = self.device_info.clone() {
-                    self.respond_device_info(&cmd.client_id, info).await;
+                if let Some(ref blob) = self.device_info_raw {
+                    self.send_to_client(&cmd.client_id, blob.clone());
                 } else {
                     let _ = self.send_to_radio(payload).await;
                 }
@@ -502,8 +471,8 @@ impl Core {
                 let _ = self.send_to_radio(payload).await;
             }
             0x14 => {
-                if let Some(ref info) = self.battery_info.clone() {
-                    self.respond_battery(&cmd.client_id, info).await;
+                if let Some(ref blob) = self.battery_info_raw {
+                    self.send_to_client(&cmd.client_id, blob.clone());
                 } else {
                     let _ = self.send_to_radio(payload).await;
                 }
@@ -525,52 +494,64 @@ impl Core {
                 let _ = self.send_to_radio(payload).await;
             }
             0x02 if payload.len() >= 14 => {
-                let from_key = &self.identity.public_key[..6];
                 let msg_type = payload[1];
                 let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
                 let text = String::from_utf8_lossy(&payload[13..]).to_string();
 
-                // Synthesize CONTACT_MSG_RECV (0x07) so other clients
-                // see a message as if it arrived over LoRa from the proxy.
-                let mut fake = Vec::with_capacity(13 + text.len());
-                fake.push(0x07);
-                fake.extend_from_slice(from_key);
-                fake.push(0); // path_len
-                fake.push(msg_type); // txt_type
-                fake.extend_from_slice(&payload[3..7]); // timestamp
-                fake.extend_from_slice(text.as_bytes());
+                // Synthesize CONTACT_MSG_RECV (0x07) so other clients see the
+                // message as if it had arrived over LoRa from the radio. The
+                // from_key must be the real radio pubkey; without it we cannot
+                // produce a coherent broadcast and we only forward.
+                if let Some(pk) = self.radio_pubkey {
+                    let from_key = &pk[..6];
+                    let mut fake = Vec::with_capacity(13 + text.len());
+                    fake.push(0x07);
+                    fake.extend_from_slice(from_key);
+                    fake.push(0); // path_len
+                    fake.push(msg_type); // txt_type
+                    fake.extend_from_slice(&payload[3..7]); // timestamp
+                    fake.extend_from_slice(text.as_bytes());
+                    self.broadcast_to_others(Some(&cmd.client_id), &fake);
 
-                self.broadcast_to_others(Some(&cmd.client_id), &fake);
+                    let _ = self
+                        .state
+                        .insert_message("contact", Some(from_key), None, &text, ts)
+                        .await;
+                } else {
+                    tracing::warn!(
+                        "no radio pubkey known, skipping synthetic broadcast for SEND_MSG"
+                    );
+                }
                 let _ = self.send_to_radio(payload).await;
-
-                let _ = self
-                    .state
-                    .insert_message("contact", Some(from_key), None, &text, ts)
-                    .await;
             }
             0x03 if payload.len() >= 8 => {
-                let from_key = &self.identity.public_key[..6];
                 let channel = payload[2] as i64;
                 let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
                 let text = String::from_utf8_lossy(&payload[7..]).to_string();
 
-                // Synthesize CHANNEL_MSG_RECV (0x08) so other clients
-                // see a message as if it arrived over LoRa from the proxy.
-                let mut fake = Vec::with_capacity(8 + text.len());
-                fake.push(0x08);
-                fake.push(payload[2]); // channel
-                fake.push(0); // path_len
-                fake.push(0); // txt_type = text
-                fake.extend_from_slice(&payload[3..7]); // timestamp
-                fake.extend_from_slice(text.as_bytes());
+                // Same as 0x02: synthesize CHANNEL_MSG_RECV (0x08) only if we
+                // know the radio pubkey to attribute it to.
+                if let Some(pk) = self.radio_pubkey {
+                    let from_key = &pk[..6];
+                    let mut fake = Vec::with_capacity(8 + text.len());
+                    fake.push(0x08);
+                    fake.push(payload[2]); // channel
+                    fake.push(0); // path_len
+                    fake.push(0); // txt_type = text
+                    fake.extend_from_slice(&payload[3..7]); // timestamp
+                    fake.extend_from_slice(text.as_bytes());
+                    self.broadcast_to_others(Some(&cmd.client_id), &fake);
 
-                self.broadcast_to_others(Some(&cmd.client_id), &fake);
+                    let _ = self
+                        .state
+                        .insert_message("channel", Some(from_key), Some(channel), &text, ts)
+                        .await;
+                } else {
+                    tracing::warn!(
+                        "no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG"
+                    );
+                }
                 let _ = self.send_to_radio(payload).await;
-
-                let _ = self
-                    .state
-                    .insert_message("channel", Some(from_key), Some(channel), &text, ts)
-                    .await;
             }
             0x20 if payload.len() > 1 => {
                 // Invalidate cached channel so next GET_CHANNEL hits the radio
@@ -579,9 +560,9 @@ impl Core {
                 let _ = self.send_to_radio(payload).await;
             }
             _ => {
-                self.self_info = None;
-                self.device_info = None;
-                self.battery_info = None;
+                self.self_info_raw = None;
+                self.device_info_raw = None;
+                self.battery_info_raw = None;
                 let _ = self.send_to_radio(payload).await;
             }
         }
@@ -606,220 +587,35 @@ impl Core {
         }
     }
 
-    async fn respond_self_info(&self, client_id: &ClientId) {
-        let mut payload = vec![0x05];
-
-        let adv_type: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("type"))
-            .map(|t| match t.as_str() {
-                "node" => 0,
-                "repeater" => 2,
-                "room" => 3,
-                _ => 1,
-            })
-            .unwrap_or(1);
-        payload.push(adv_type);
-
-        let tx_power: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("tx_power"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        payload.push(tx_power);
-
-        let max_tx_power: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("max_tx_power"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20);
-        payload.push(max_tx_power);
-
-        payload.extend_from_slice(&self.identity.public_key);
-
-        let lat: f64 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("lat"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        let lat_i = (lat * 1_000_000.0) as i32;
-        payload.extend_from_slice(&i32::to_le_bytes(lat_i));
-
-        let lon: f64 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("lon"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        let lon_i = (lon * 1_000_000.0) as i32;
-        payload.extend_from_slice(&i32::to_le_bytes(lon_i));
-
-        let multi_acks: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("multi_acks"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        payload.push(multi_acks);
-
-        let adv_loc_policy: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("adv_loc_policy"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        payload.push(adv_loc_policy);
-
-        let telemetry_mode: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("telemetry_mode"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        payload.push(telemetry_mode);
-
-        let manual_add_contacts: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("manual_add_contacts"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        payload.push(manual_add_contacts);
-
-        let freq_khz: u32 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("freq_mhz"))
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|f| (f * 1000.0) as u32)
-            .unwrap_or(868_000);
-        payload.extend_from_slice(&u32::to_le_bytes(freq_khz));
-
-        let bw_hz: u32 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("bw_khz"))
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|f| (f * 1000.0) as u32)
-            .unwrap_or(125_000);
-        payload.extend_from_slice(&u32::to_le_bytes(bw_hz));
-
-        let sf: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("sf"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(12);
-        payload.push(sf);
-
-        let cr: u8 = self
-            .self_info
-            .as_ref()
-            .and_then(|i| i.get("cr"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
-        payload.push(cr);
-        payload.extend_from_slice(self.identity.name.as_bytes());
-
-        self.send_to_client(client_id, payload);
-        tracing::debug!("responded with SELF_INFO");
-    }
-
-    async fn respond_device_info(&self, client_id: &ClientId, info: &HashMap<String, String>) {
-        let fw_ver: u8 = info
-            .get("fw_version")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        let mut payload = vec![0x0D, fw_ver];
-
-        if fw_ver >= 3 {
-            let max_contacts: u8 = info
-                .get("max_contacts")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100);
-            let max_channels: u8 = info
-                .get("max_channels")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(40);
-            payload.push(max_contacts / 2);
-            payload.push(max_channels);
-
-            let ble_pin: u32 = info
-                .get("ble_pin")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(123456);
-            payload.extend_from_slice(&u32::to_le_bytes(ble_pin));
-
-            let build = info
-                .get("fw_build")
-                .map(|s| s.as_bytes())
-                .unwrap_or(b"coresplitter");
-            let mut build_b = [0u8; 12];
-            let blen = build.len().min(12);
-            build_b[..blen].copy_from_slice(&build[..blen]);
-            payload.extend_from_slice(&build_b);
-
-            let model = info
-                .get("model")
-                .map(|s| s.as_bytes())
-                .unwrap_or(b"Core Splitter Virtual Node");
-            let mut model_b = [0u8; 40];
-            let mlen = model.len().min(40);
-            model_b[..mlen].copy_from_slice(&model[..mlen]);
-            payload.extend_from_slice(&model_b);
-
-            let version = info
-                .get("version")
-                .map(|s| s.as_bytes())
-                .unwrap_or(b"0.1.0");
-            let mut ver_b = [0u8; 20];
-            let vlen = version.len().min(20);
-            ver_b[..vlen].copy_from_slice(&version[..vlen]);
-            payload.extend_from_slice(&ver_b);
-
-            let client_repeat: u8 = info
-                .get("client_repeat")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            payload.push(client_repeat);
-
-            let path_hash_mode: u8 = info
-                .get("path_hash_mode")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            payload.push(path_hash_mode);
+    fn extract_radio_identity(&mut self, blob: &[u8]) {
+        // SELF_INFO layout: [0]=0x05, [1]=adv_type, [2]=tx_power, [3]=max_tx_power,
+        // [4..36]=pubkey, ... name at the tail (offset depends on whether sf/cr
+        // bytes are present; see decode_response_payload for the spec).
+        if blob.len() >= 36 {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&blob[4..36]);
+            self.radio_pubkey = Some(pk);
         }
-
-        self.send_to_client(client_id, payload);
+        if let Some(decoded) = decode_response_payload(0x05, blob)
+            && let Some(DecodedValue::String(name)) = decoded.get("name")
+        {
+            self.radio_name = Some(name.clone());
+        }
     }
 
-    async fn respond_battery(&self, client_id: &ClientId, info: &HashMap<String, String>) {
-        let mut payload = vec![0x0C];
-
-        let mv: u16 = info
-            .get("level_mv")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        payload.extend_from_slice(&u16::to_le_bytes(mv));
-
-        let used_kb: u32 = info
-            .get("used_kb")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        payload.extend_from_slice(&u32::to_le_bytes(used_kb));
-
-        let total_kb: u32 = info
-            .get("total_kb")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        payload.extend_from_slice(&u32::to_le_bytes(total_kb));
-
-        self.send_to_client(client_id, payload);
-        tracing::debug!(mv, "responded with BATTERY");
+    fn extract_max_channels(&mut self, blob: &[u8]) {
+        if let Some(decoded) = decode_response_payload(0x0D, blob)
+            && let Some(DecodedValue::Integer(n)) = decoded.get("max_channels")
+        {
+            let max = (*n).min(255) as u8;
+            if max > 0 {
+                self.max_channels = max;
+                tracing::info!(
+                    max_channels = self.max_channels,
+                    "radio reports max channels"
+                );
+            }
+        }
     }
 
     async fn respond_contacts(&self, client_id: &ClientId, contacts: &[CachedContact]) {
@@ -930,73 +726,21 @@ impl Core {
                 }
             }
             0x05 => {
-                if let Some(decoded) = decode_response_payload(code, payload) {
-                    let mut info = HashMap::new();
-                    for (k, v) in &decoded {
-                        match v {
-                            DecodedValue::String(s) => {
-                                info.insert(k.clone(), s.clone());
-                            }
-                            DecodedValue::Integer(i) => {
-                                info.insert(k.clone(), i.to_string());
-                            }
-                            DecodedValue::Float(f) => {
-                                info.insert(k.clone(), f.to_string());
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Ok(json) = serde_json::to_string(&info) {
-                        let _ = self.state.kv_set("self_info", json.as_bytes()).await;
-                    }
-                    self.self_info = Some(info);
-                }
+                let blob = payload.to_vec();
+                let _ = self.state.kv_set("self_info_raw", &blob).await;
+                self.extract_radio_identity(&blob);
+                self.self_info_raw = Some(blob);
             }
             0x0C => {
-                if let Some(decoded) = decode_response_payload(code, payload) {
-                    let mut info = HashMap::new();
-                    for (k, v) in &decoded {
-                        match v {
-                            DecodedValue::String(s) => {
-                                info.insert(k.clone(), s.clone());
-                            }
-                            DecodedValue::Integer(i) => {
-                                info.insert(k.clone(), i.to_string());
-                            }
-                            DecodedValue::Float(f) => {
-                                info.insert(k.clone(), f.to_string());
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Ok(json) = serde_json::to_string(&info) {
-                        let _ = self.state.kv_set("battery_info", json.as_bytes()).await;
-                    }
-                    self.battery_info = Some(info);
-                }
+                let blob = payload.to_vec();
+                let _ = self.state.kv_set("battery_info_raw", &blob).await;
+                self.battery_info_raw = Some(blob);
             }
             0x0D => {
-                if let Some(decoded) = decode_response_payload(code, payload) {
-                    let mut info = HashMap::new();
-                    for (k, v) in &decoded {
-                        match v {
-                            DecodedValue::String(s) => {
-                                info.insert(k.clone(), s.clone());
-                            }
-                            DecodedValue::Integer(i) => {
-                                info.insert(k.clone(), i.to_string());
-                            }
-                            DecodedValue::Float(f) => {
-                                info.insert(k.clone(), f.to_string());
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Ok(json) = serde_json::to_string(&info) {
-                        let _ = self.state.kv_set("device_info", json.as_bytes()).await;
-                    }
-                    self.device_info = Some(info);
-                }
+                let blob = payload.to_vec();
+                let _ = self.state.kv_set("device_info_raw", &blob).await;
+                self.extract_max_channels(&blob);
+                self.device_info_raw = Some(blob);
             }
             0x07 => {
                 if let Some(decoded) = decode_response_payload(code, payload) {

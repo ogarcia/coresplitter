@@ -1,9 +1,11 @@
 # Core Splitter
 
-Virtual node proxy for [MeshCore](https://meshcore.io). Connects to a physical
-radio (serial, BLE, or TCP), syncs contacts and channels into SQLite, and
-serves a TCP interface to multiple concurrent clients. Every client sees the
-same state as the physical radio — the proxy acts as a **faithful mirror**.
+[MeshCore](https://meshcore.io) **client multiplexer with cache**. Speaks the
+companion protocol on both sides: it connects to a physical radio (serial,
+BLE, or TCP) and serves a TCP interface to multiple concurrent companion
+clients. Contacts, channels, SELF_INFO, DEVICE_INFO and BATTERY are cached in
+SQLite so cold reads don't hit the radio. Every client sees the same state as
+the physical radio — the proxy acts as a **faithful mirror**.
 
 ## How it works
 
@@ -106,7 +108,6 @@ cargo run --release --features ble -- \
 | `CORESPLITTER_TCP_BACKEND_PORT` | Backend TCP port (default: 5000) |
 | `CORESPLITTER_TCP_FRONTEND_HOST` | Frontend TCP bind (default: 0.0.0.0) |
 | `CORESPLITTER_TCP_FRONTEND_PORT` | Frontend TCP port (default: 5000) |
-| `CORESPLITTER_NODE_NAME` | Virtual node name (defaults to physical radio's name) |
 | `CORESPLITTER_DATA_DIR` | Data directory (default: ./data) |
 | `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `CORESPLITTER_LOG_JSON` | Enable JSON event logging |

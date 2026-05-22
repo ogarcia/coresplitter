@@ -112,6 +112,17 @@ impl NodeState {
         .execute(&self.pool)
         .await?;
 
+        // Drop obsolete kv_store entries from prior versions. self_info/
+        // device_info/battery_info used to be JSON; identity.* was a SHA256
+        // pseudo-keypair that no longer exists.
+        sqlx::query(
+            "DELETE FROM kv_store WHERE key IN \
+             ('self_info', 'device_info', 'battery_info', \
+              'identity.seed', 'identity.pk')",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 

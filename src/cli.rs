@@ -5,7 +5,11 @@ use clap::Parser;
 use crate::core::{BackendType, CoreConfig, LogLevel};
 
 #[derive(Parser, Debug)]
-#[command(name = "coresplitter", version, about = "MeshCore virtual node proxy")]
+#[command(
+    name = "coresplitter",
+    version,
+    about = "MeshCore client multiplexer with cache"
+)]
 pub struct Cli {
     /// Serial port path (e.g., /dev/ttyUSB0)
     #[arg(long, short = 's', env = "CORESPLITTER_SERIAL_PORT")]
@@ -31,10 +35,10 @@ pub struct Cli {
     #[arg(
         long,
         short = 'p',
-        default_value = "5000",
+        default_value_t = 5000,
         env = "CORESPLITTER_TCP_BACKEND_PORT"
     )]
-    pub tcp_backend_port: Option<u16>,
+    pub tcp_backend_port: u16,
 
     /// TCP frontend bind address
     #[arg(
@@ -48,11 +52,7 @@ pub struct Cli {
     #[arg(long, default_value_t = 5000, env = "CORESPLITTER_TCP_FRONTEND_PORT")]
     pub tcp_frontend_port: u16,
 
-    /// Node name (sent in SELF_INFO; defaults to the real radio's name)
-    #[arg(long, default_value = "", env = "CORESPLITTER_NODE_NAME")]
-    pub node_name: String,
-
-    /// Data directory for identity keys and state database
+    /// Data directory for the state database
     #[arg(long, default_value = "./data", env = "CORESPLITTER_DATA_DIR")]
     pub data_dir: PathBuf,
 
@@ -78,7 +78,6 @@ impl Cli {
         } else if self.tcp_backend_host.is_some() {
             BackendType::Tcp
         } else {
-            // Default to TCP backend localhost:5000 for development
             BackendType::Serial
         };
 
@@ -99,7 +98,6 @@ impl Cli {
             tcp_frontend_host: self.tcp_frontend_host,
             tcp_frontend_port: self.tcp_frontend_port,
             data_dir: self.data_dir,
-            node_name: self.node_name,
             event_log_level,
             event_log_json: self.json,
             record_radio_rx: self.record_radio_rx,
