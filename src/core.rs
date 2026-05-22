@@ -17,13 +17,31 @@ use crate::protocol::decode::{
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Response codes that are spontaneous push events from the radio and never
+/// complete an in-flight request. They are always broadcast to every client.
+/// ACK (0x82) is also a push from the in_flight slot's point of view but
+/// has its own dedicated routing via `pending_acks`.
+const PUSH_EVENT_CODES: &[u8] = &[
+    0x80, // ADVERTISEMENT
+    0x81, // PATH_UPDATE
+    0x83, // MESSAGES_WAITING
+    0x88, // LOG_DATA
+    0x8A, // NEW_ADVERT
+];
+
+fn is_push_event(code: u8) -> bool {
+    PUSH_EVENT_CODES.contains(&code)
+}
+
 /// What a request is waiting for, to know when to free the slot.
 #[derive(Debug, Clone)]
 enum Awaiting {
-    /// A single response frame whose code is in this list completes the request.
-    Single(Vec<u8>),
-    /// A multi-frame stream: any frame whose code is in `frame_codes` belongs
-    /// to the response; the request is complete when `terminator_code` arrives.
+    /// Any single non-push response frame completes the request. This is
+    /// the default for most commands: the radio replies with exactly one
+    /// frame per command (OK / ERROR / DEVICE_INFO / CHANNEL_INFO / ...).
+    Any,
+    /// A multi-frame stream: any frame whose code is in `frame_codes`
+    /// belongs to the response; the request completes with `terminator_code`.
     Stream {
         frame_codes: Vec<u8>,
         terminator_code: u8,
@@ -44,25 +62,19 @@ struct Queued {
     payload: Vec<u8>,
 }
 
-/// Mapping from a client command code to the response shape we expect from
-/// the radio. Used to know when to release the in_flight slot.
+/// Map a client command code to the shape of the radio's reply.
 fn awaiting_for(cmd_code: u8) -> Awaiting {
     match cmd_code {
-        0x01 => Awaiting::Single(vec![0x05]), // AppStart → SELF_INFO
-        0x02 | 0x03 => Awaiting::Single(vec![0x06, 0x01]), // SEND_* → MSG_SENT / ERROR
+        // GET_CONTACTS → CONTACT_START + N x CONTACT + CONTACT_END
         0x04 => Awaiting::Stream {
-            // GET_CONTACTS → CONTACT_START + N x CONTACT + CONTACT_END
             frame_codes: vec![0x02, 0x03],
             terminator_code: 0x04,
         },
-        0x05 => Awaiting::Single(vec![0x09, 0x01]), // GET_TIME → CURRENT_TIME / ERROR
-        0x0A => Awaiting::Single(vec![0x07, 0x08, 0x10, 0x11, 0x0A]), // GET_MSG → msg / NO_MORE
-        0x14 => Awaiting::Single(vec![0x0C, 0x01]), // GET_BATTERY → BATTERY / ERROR
-        0x16 => Awaiting::Single(vec![0x0D, 0x01]), // DEVICE_QUERY → DEVICE_INFO / ERROR
-        0x1A => Awaiting::Single(vec![0x85, 0x86, 0x01]), // LOGIN → SUCCESS / FAILED / ERROR
-        0x1F => Awaiting::Single(vec![0x12, 0x01]), // GET_CHANNEL → CHANNEL_INFO / ERROR
-        // Everything else (setters, advert, reboot, ...) replies with OK or ERROR.
-        _ => Awaiting::Single(vec![0x00, 0x01]),
+        // Every other command replies with a single non-push frame.
+        // Routing is decided by "not a push event" rather than by an
+        // explicit allow-list so unusual commands (SHARE_CONTACT,
+        // GET_TELEMETRY, GET_STATS, ...) work without per-command entries.
+        _ => Awaiting::Any,
     }
 }
 
@@ -851,8 +863,13 @@ impl Core {
             return false;
         };
 
+        // Push events never complete a request, even if a slot is open.
+        if is_push_event(code) {
+            return false;
+        }
+
         let (matched, is_terminator) = match &in_flight.awaiting {
-            Awaiting::Single(codes) => (codes.contains(&code), true),
+            Awaiting::Any => (true, true),
             Awaiting::Stream {
                 frame_codes,
                 terminator_code,
