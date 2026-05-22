@@ -355,8 +355,6 @@ class FakeRadio:
 
             print(f"  [serial] read {len(data)}B: {data.hex()[:60]}", flush=True)
             buf.extend(data)
-
-            buf.extend(data)
             while True:
                 result = decode_frame(bytes(buf))
                 if result is None:
