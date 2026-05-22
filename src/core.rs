@@ -485,6 +485,11 @@ impl Core {
                 let _ = self.send_to_radio(payload).await;
             }
             0x02 if payload.len() >= 14 => {
+                if self.radio_send_tx.is_none() {
+                    tracing::warn!("radio offline, replying ERROR to SEND_MSG");
+                    self.send_to_client(&cmd.client_id, vec![0x01, 0x01]);
+                    return;
+                }
                 let msg_type = payload[1];
                 let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
                 let text = String::from_utf8_lossy(&payload[13..]).to_string();
@@ -516,6 +521,11 @@ impl Core {
                 let _ = self.send_to_radio(payload).await;
             }
             0x03 if payload.len() >= 8 => {
+                if self.radio_send_tx.is_none() {
+                    tracing::warn!("radio offline, replying ERROR to SEND_CHAN_MSG");
+                    self.send_to_client(&cmd.client_id, vec![0x01, 0x01]);
+                    return;
+                }
                 let channel = payload[2] as i64;
                 let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
                 let text = String::from_utf8_lossy(&payload[7..]).to_string();
