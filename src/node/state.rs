@@ -33,6 +33,11 @@ impl NodeState {
             .filename(path)
             .create_if_missing(true);
 
+        // Single connection on purpose: the Core actor serializes all DB
+        // access (one task owns &NodeState through Arc and only one task
+        // ever calls into it at a time), so concurrent connections would
+        // sit idle. Using the pool API instead of a bare SqliteConnection
+        // keeps the ergonomic sqlx::query(&self.pool) call sites.
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
