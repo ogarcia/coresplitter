@@ -21,14 +21,25 @@ the physical radio — the proxy acts as a **faithful mirror**.
                        └────────────────┘                    └──────────┘
 ```
 
-1. Proxy connects to the physical radio and syncs contacts/channels to SQLite
-2. Opens a TCP server for clients to connect to
-3. Client commands served from cache when possible (GET_CONTACTS,
-   GET_CHANNEL) or forwarded to the radio
-4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG) are broadcast to other clients
-   immediately and forwarded to the radio
-5. Incoming messages from the radio are cached in SQLite and broadcast to all
-   clients
+1. Proxy connects to the physical radio and syncs contacts and channels
+   into SQLite at startup.
+2. Opens a TCP server for companion clients to connect to.
+3. Client commands are served from cache when possible (SELF_INFO,
+   DEVICE_INFO, BATTERY, GET_CONTACTS, GET_CHANNEL); the rest are
+   serialized through a FIFO queue and forwarded one at a time to the
+   radio. The radio's reply is routed back to the originating client.
+4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG): after the radio
+   accepts the forward, a synthetic CONTACT_MSG_RECV / CHANNEL_MSG_RECV
+   is echoed to the other clients so they see the message as if it
+   had arrived over LoRa. If the radio is unreachable the originator
+   gets an ERROR and nothing is echoed or persisted.
+5. Incoming LoRa traffic: the radio pushes MESSAGES_WAITING (0x83) to
+   every client; the first one to poll with GET_MSG retrieves the
+   frame and the proxy fans it out to the rest, so every client sees
+   inbound messages even though only one poll consumed it.
+6. Push events from the radio (ADVERTISEMENT, NEW_ADVERT, LOG_DATA,
+   ...) go to everybody. Late LoRa-delivery ACKs (0x82) are routed
+   back to the original sender by `ack_code`.
 
 ## Requirements
 
@@ -169,4 +180,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 15/15 PASS on TCP backend against fake radio
+- **Tests**: 17/17 PASS (10 cases) on TCP backend against fake radio
