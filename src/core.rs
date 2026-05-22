@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -12,6 +13,58 @@ use crate::node::state::{CachedChannel, CachedContact, NodeState};
 use crate::protocol::decode::{
     DecodedValue, decode_command_payload, decode_response_payload, format_decoded,
 };
+
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a request is waiting for, to know when to free the slot.
+#[derive(Debug, Clone)]
+enum Awaiting {
+    /// A single response frame whose code is in this list completes the request.
+    Single(Vec<u8>),
+    /// A multi-frame stream: any frame whose code is in `frame_codes` belongs
+    /// to the response; the request is complete when `terminator_code` arrives.
+    Stream {
+        frame_codes: Vec<u8>,
+        terminator_code: u8,
+    },
+}
+
+#[derive(Debug)]
+struct InFlight {
+    client_id: ClientId,
+    cmd_code: u8,
+    sent_at: Instant,
+    awaiting: Awaiting,
+}
+
+#[derive(Debug)]
+struct Queued {
+    client_id: ClientId,
+    payload: Vec<u8>,
+}
+
+/// Mapping from a client command code to the response shape we expect from
+/// the radio. Used to know when to release the in_flight slot.
+fn awaiting_for(cmd_code: u8) -> Awaiting {
+    match cmd_code {
+        0x01 => Awaiting::Single(vec![0x05]), // AppStart → SELF_INFO
+        0x02 | 0x03 => Awaiting::Single(vec![0x06, 0x01]), // SEND_* → MSG_SENT / ERROR
+        0x04 => Awaiting::Stream {
+            // GET_CONTACTS → CONTACT_START + N x CONTACT + CONTACT_END
+            frame_codes: vec![0x02, 0x03],
+            terminator_code: 0x04,
+        },
+        0x05 => Awaiting::Single(vec![0x09, 0x01]), // GET_TIME → CURRENT_TIME / ERROR
+        0x0A => Awaiting::Single(vec![0x07, 0x08, 0x10, 0x11, 0x0A]), // GET_MSG → msg / NO_MORE
+        0x14 => Awaiting::Single(vec![0x0C, 0x01]), // GET_BATTERY → BATTERY / ERROR
+        0x16 => Awaiting::Single(vec![0x0D, 0x01]), // DEVICE_QUERY → DEVICE_INFO / ERROR
+        0x1A => Awaiting::Single(vec![0x85, 0x86, 0x01]), // LOGIN → SUCCESS / FAILED / ERROR
+        0x1F => Awaiting::Single(vec![0x12, 0x01]), // GET_CHANNEL → CHANNEL_INFO / ERROR
+        // Everything else (setters, advert, reboot, ...) replies with OK or ERROR.
+        _ => Awaiting::Single(vec![0x00, 0x01]),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
@@ -25,6 +78,7 @@ pub struct CoreConfig {
     pub serial_port: Option<String>,
     pub serial_baud: u32,
     pub ble_address: Option<String>,
+    #[cfg_attr(not(feature = "ble"), allow(dead_code))]
     pub ble_pin: String,
     pub tcp_backend_host: Option<String>,
     pub tcp_backend_port: u16,
@@ -59,13 +113,13 @@ pub struct Core {
     command_rx: mpsc::UnboundedReceiver<ClientCommand>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     client_channels: ClientDirectMap,
-    // Clients waiting for the immediate MSG_SENT (0x06) or ERROR (0x01)
-    // reply after a SEND_MSG / SEND_CHAN_MSG forward. FIFO: assumes the
-    // radio replies in submission order.
-    pending_send_replies: VecDeque<ClientId>,
+    // The radio handles one command at a time. We serialize: a single
+    // request is in flight; further client commands wait in pending_queue.
+    in_flight: Option<InFlight>,
+    pending_queue: VecDeque<Queued>,
     // Clients waiting for the (possibly much later) LoRa-delivery ACK
     // (0x82), keyed by the 4-byte expected_ack the radio handed back in
-    // the corresponding MSG_SENT.
+    // the corresponding MSG_SENT. Independent of the in_flight slot.
     pending_acks: HashMap<[u8; 4], ClientId>,
 }
 
@@ -94,7 +148,8 @@ impl Core {
             command_rx,
             broadcast_tx,
             client_channels: Arc::new(Mutex::new(HashMap::new())),
-            pending_send_replies: VecDeque::new(),
+            in_flight: None,
+            pending_queue: VecDeque::new(),
             pending_acks: HashMap::new(),
         })
     }
@@ -156,6 +211,9 @@ impl Core {
 
         tracing::info!("multiplexer ready, accepting clients");
 
+        let mut timeout_tick = tokio::time::interval(TIMEOUT_CHECK_INTERVAL);
+        timeout_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 biased;
@@ -177,6 +235,9 @@ impl Core {
                             self.reconnect_radio().await;
                         }
                     }
+                }
+                _ = timeout_tick.tick() => {
+                    self.check_in_flight_timeout().await;
                 }
             }
         }
@@ -438,27 +499,42 @@ impl Core {
     }
 
     async fn handle_client_command(&mut self, cmd: ClientCommand) {
-        let payload = &cmd.payload;
-        if payload.is_empty() {
+        if cmd.payload.is_empty() {
             return;
         }
 
-        let cmd_code = payload[0];
-        self.log_event("->", cmd_code, payload);
+        let cmd_code = cmd.payload[0];
+        self.log_event("->", cmd_code, &cmd.payload);
 
+        // 1. Cache-only paths: serve from RAM / SQLite, never touch the radio.
+        if self.try_serve_from_cache(cmd_code, &cmd).await {
+            return;
+        }
+
+        // 2. Anything else goes through the serialized radio queue.
+        self.enqueue_or_dispatch(cmd.client_id, cmd.payload).await;
+    }
+
+    /// Returns true if the command was fully served from cache without
+    /// forwarding to the radio.
+    async fn try_serve_from_cache(&self, cmd_code: u8, cmd: &ClientCommand) -> bool {
         match cmd_code {
             0x01 => {
                 if let Some(ref blob) = self.self_info_raw {
                     self.send_to_client(&cmd.client_id, blob.clone());
-                } else {
-                    let _ = self.send_to_radio(payload).await;
+                    return true;
                 }
             }
             0x16 => {
                 if let Some(ref blob) = self.device_info_raw {
                     self.send_to_client(&cmd.client_id, blob.clone());
-                } else {
-                    let _ = self.send_to_radio(payload).await;
+                    return true;
+                }
+            }
+            0x14 => {
+                if let Some(ref blob) = self.battery_info_raw {
+                    self.send_to_client(&cmd.client_id, blob.clone());
+                    return true;
                 }
             }
             0x04 => {
@@ -466,125 +542,171 @@ impl Core {
                     && !contacts.is_empty()
                 {
                     self.respond_contacts(&cmd.client_id, &contacts).await;
-                    return;
-                }
-                let _ = self.send_to_radio(payload).await;
-            }
-            0x14 => {
-                if let Some(ref blob) = self.battery_info_raw {
-                    self.send_to_client(&cmd.client_id, blob.clone());
-                } else {
-                    let _ = self.send_to_radio(payload).await;
+                    return true;
                 }
             }
             0x1F => {
-                let requested_idx = if payload.len() > 1 {
-                    payload[1] as i64
+                let requested_idx = if cmd.payload.len() > 1 {
+                    cmd.payload[1] as i64
                 } else {
                     -1
                 };
-                if let Ok(channels) = self.state.get_channels().await {
-                    tracing::info!(n = channels.len(), "GET_CHANNEL: channels in DB");
-                    if let Some(ch) = channels.iter().find(|c| c.idx == requested_idx) {
-                        self.respond_channel_info(&cmd.client_id, ch).await;
-                        return;
-                    }
+                if let Ok(channels) = self.state.get_channels().await
+                    && let Some(ch) = channels.iter().find(|c| c.idx == requested_idx)
+                {
+                    self.respond_channel_info(&cmd.client_id, ch).await;
+                    return true;
                 }
-                tracing::info!("GET_CHANNEL: forwarding to radio");
-                let _ = self.send_to_radio(payload).await;
             }
+            _ => {}
+        }
+        false
+    }
+
+    /// Enqueue the command if the radio is busy with a previous request,
+    /// otherwise dispatch it immediately.
+    async fn enqueue_or_dispatch(&mut self, client_id: ClientId, payload: Vec<u8>) {
+        if self.in_flight.is_none() {
+            self.dispatch_to_radio(client_id, payload).await;
+        } else {
+            self.pending_queue.push_back(Queued { client_id, payload });
+        }
+    }
+
+    /// Forward a command to the radio and set up the in_flight slot.
+    /// On forward failure replies ERROR to the client and leaves the slot
+    /// free. On success performs post-forward side effects (echo synthesis
+    /// for SEND_*, cache invalidation for setters, etc).
+    async fn dispatch_to_radio(&mut self, client_id: ClientId, payload: Vec<u8>) {
+        let cmd_code = payload[0];
+
+        if let Err(e) = self.send_to_radio(&payload).await {
+            tracing::warn!(error = %e, cmd = format_args!("0x{cmd_code:02x}"), "forward failed");
+            self.send_to_client(&client_id, vec![0x01, 0x01]);
+            return;
+        }
+
+        match cmd_code {
             0x02 if payload.len() >= 14 => {
-                // Forward first; the echo, the DB insert and the
-                // pending-reply slot only happen if the radio actually
-                // got the frame.
-                if let Err(e) = self.send_to_radio(payload).await {
-                    tracing::warn!(error = %e, "forward failed, replying ERROR to SEND_MSG");
-                    self.send_to_client(&cmd.client_id, vec![0x01, 0x01]);
-                    return;
-                }
-                self.pending_send_replies.push_back(cmd.client_id);
-
-                let msg_type = payload[1];
-                let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
-                let text = String::from_utf8_lossy(&payload[13..]).to_string();
-
-                // Synthesize CONTACT_MSG_RECV (0x07) so other clients see
-                // the message as if it had arrived over LoRa from the
-                // radio. Needs the real radio pubkey for from_key; without
-                // it we skip the echo but the forward already happened.
-                if let Some(pk) = self.radio_pubkey {
-                    let from_key = &pk[..6];
-                    let mut fake = Vec::with_capacity(13 + text.len());
-                    fake.push(0x07);
-                    fake.extend_from_slice(from_key);
-                    fake.push(0); // path_len
-                    fake.push(msg_type); // txt_type
-                    fake.extend_from_slice(&payload[3..7]); // timestamp
-                    fake.extend_from_slice(text.as_bytes());
-                    self.broadcast_to_others(Some(&cmd.client_id), &fake);
-
-                    let _ = self
-                        .state
-                        .insert_message("contact", Some(from_key), None, &text, ts)
-                        .await;
-                } else {
-                    tracing::warn!(
-                        "no radio pubkey known, skipping synthetic broadcast for SEND_MSG"
-                    );
-                }
+                self.synthesize_contact_echo(&client_id, &payload).await;
             }
             0x03 if payload.len() >= 8 => {
-                if let Err(e) = self.send_to_radio(payload).await {
-                    tracing::warn!(error = %e, "forward failed, replying ERROR to SEND_CHAN_MSG");
-                    self.send_to_client(&cmd.client_id, vec![0x01, 0x01]);
-                    return;
-                }
-                self.pending_send_replies.push_back(cmd.client_id);
-
-                let channel = payload[2] as i64;
-                let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
-                let text = String::from_utf8_lossy(&payload[7..]).to_string();
-
-                if let Some(pk) = self.radio_pubkey {
-                    let from_key = &pk[..6];
-                    let mut fake = Vec::with_capacity(8 + text.len());
-                    fake.push(0x08);
-                    fake.push(payload[2]); // channel
-                    fake.push(0); // path_len
-                    fake.push(0); // txt_type = text
-                    fake.extend_from_slice(&payload[3..7]); // timestamp
-                    fake.extend_from_slice(text.as_bytes());
-                    self.broadcast_to_others(Some(&cmd.client_id), &fake);
-
-                    let _ = self
-                        .state
-                        .insert_message("channel", Some(from_key), Some(channel), &text, ts)
-                        .await;
-                } else {
-                    tracing::warn!(
-                        "no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG"
-                    );
-                }
+                self.synthesize_channel_echo(&client_id, &payload).await;
             }
             0x20 if payload.len() > 1 => {
-                // Invalidate cached channel so next GET_CHANNEL hits the radio
                 let idx = payload[1] as i64;
                 let _ = self.state.delete_channel(idx).await;
-                let _ = self.send_to_radio(payload).await;
             }
-            // Write commands that mutate radio state visible in SELF_INFO,
-            // DEVICE_INFO or BATTERY. Invalidate cached blobs so the next
-            // read forces a round-trip and repopulates them.
+            // Setters that mutate SELF_INFO / DEVICE_INFO / BATTERY.
             0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 => {
                 self.self_info_raw = None;
                 self.device_info_raw = None;
                 self.battery_info_raw = None;
-                let _ = self.send_to_radio(payload).await;
             }
-            _ => {
-                let _ = self.send_to_radio(payload).await;
-            }
+            _ => {}
         }
+
+        self.in_flight = Some(InFlight {
+            client_id,
+            cmd_code,
+            sent_at: Instant::now(),
+            awaiting: awaiting_for(cmd_code),
+        });
+    }
+
+    /// Pop and dispatch the next queued command for which the originating
+    /// client is still connected. Stops at the first one successfully
+    /// dispatched, or when the queue empties.
+    async fn advance_queue(&mut self) {
+        while let Some(next) = self.pending_queue.pop_front() {
+            if !self.client_is_alive(&next.client_id) {
+                tracing::debug!(client = %next.client_id, "dropping queued request: client gone");
+                continue;
+            }
+            self.dispatch_to_radio(next.client_id, next.payload).await;
+            if self.in_flight.is_some() {
+                return;
+            }
+            // dispatch failed; ERROR already sent. Try the next.
+        }
+    }
+
+    fn client_is_alive(&self, client_id: &ClientId) -> bool {
+        self.client_channels.lock().unwrap().contains_key(client_id)
+    }
+
+    /// Synthesize a CONTACT_MSG_RECV (0x07) for the rest of the clients so
+    /// they see this message as if it had arrived over LoRa from the radio.
+    async fn synthesize_contact_echo(&self, sender: &ClientId, payload: &[u8]) {
+        let Some(pk) = self.radio_pubkey else {
+            tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_MSG");
+            return;
+        };
+        let from_key = &pk[..6];
+        let msg_type = payload[1];
+        let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
+        let text = String::from_utf8_lossy(&payload[13..]).to_string();
+
+        let mut fake = Vec::with_capacity(13 + text.len());
+        fake.push(0x07);
+        fake.extend_from_slice(from_key);
+        fake.push(0); // path_len
+        fake.push(msg_type); // txt_type
+        fake.extend_from_slice(&payload[3..7]); // timestamp
+        fake.extend_from_slice(text.as_bytes());
+        self.broadcast_to_others(Some(sender), &fake);
+
+        let _ = self
+            .state
+            .insert_message("contact", Some(from_key), None, &text, ts)
+            .await;
+    }
+
+    /// Synthesize a CHANNEL_MSG_RECV (0x08) for the rest of the clients.
+    async fn synthesize_channel_echo(&self, sender: &ClientId, payload: &[u8]) {
+        let Some(pk) = self.radio_pubkey else {
+            tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG");
+            return;
+        };
+        let from_key = &pk[..6];
+        let channel = payload[2] as i64;
+        let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
+        let text = String::from_utf8_lossy(&payload[7..]).to_string();
+
+        let mut fake = Vec::with_capacity(8 + text.len());
+        fake.push(0x08);
+        fake.push(payload[2]); // channel
+        fake.push(0); // path_len
+        fake.push(0); // txt_type = text
+        fake.extend_from_slice(&payload[3..7]); // timestamp
+        fake.extend_from_slice(text.as_bytes());
+        self.broadcast_to_others(Some(sender), &fake);
+
+        let _ = self
+            .state
+            .insert_message("channel", Some(from_key), Some(channel), &text, ts)
+            .await;
+    }
+
+    /// Called on every timeout tick. If the current in_flight has been
+    /// pending longer than IN_FLIGHT_TIMEOUT, fail it with ERROR and
+    /// advance the queue.
+    async fn check_in_flight_timeout(&mut self) {
+        let timed_out = self
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| f.sent_at.elapsed() >= IN_FLIGHT_TIMEOUT);
+        if !timed_out {
+            return;
+        }
+        let f = self.in_flight.take().expect("checked Some above");
+        tracing::warn!(
+            client = %f.client_id,
+            cmd = format_args!("0x{:02x}", f.cmd_code),
+            "in_flight timeout, replying ERROR"
+        );
+        self.send_to_client(&f.client_id, vec![0x01, 0x01]);
+        self.advance_queue().await;
     }
 
     fn send_to_client(&self, client_id: &ClientId, payload: Vec<u8>) {
@@ -708,50 +830,74 @@ impl Core {
             let _ = self.state.insert_raw_rx(resp_code, &payload).await;
         }
 
-        // Try to route correlated responses to a specific client. If the
-        // routing doesn't apply (no pending request, or this is a real
-        // push event), fall through to broadcasting it to everybody.
-        if self.try_route_correlated(resp_code, &payload) {
+        // 1. If the frame completes (or belongs to) the in_flight request,
+        //    route it to that client.
+        if self.try_route_to_in_flight(resp_code, &payload).await {
             return;
         }
-
+        // 2. If it's a late ACK matching a previous MSG_SENT, route it.
+        if self.try_route_ack(resp_code, &payload) {
+            return;
+        }
+        // 3. Otherwise it's a spontaneous push event from the radio
+        //    (MESSAGES_WAITING, ADVERTISEMENT, NEW_ADVERT, ...).
         let _ = self.broadcast_tx.send(payload);
     }
 
-    fn try_route_correlated(&mut self, code: u8, payload: &[u8]) -> bool {
-        match code {
-            // MSG_SENT: immediate reply to a SEND_MSG / SEND_CHAN_MSG.
-            // Record the expected_ack so we can route the later 0x82.
-            0x06 if payload.len() >= 10 => {
-                if let Some(client_id) = self.pending_send_replies.pop_front() {
-                    if let Ok(ack) = payload[2..6].try_into() {
-                        self.pending_acks.insert(ack, client_id);
-                    }
-                    self.send_to_client(&client_id, payload.to_vec());
-                    return true;
-                }
+    /// Match the response against the current in_flight request. Returns
+    /// true if it was routed (whether or not it terminated the request).
+    async fn try_route_to_in_flight(&mut self, code: u8, payload: &[u8]) -> bool {
+        let Some(in_flight) = self.in_flight.as_ref() else {
+            return false;
+        };
+
+        let (matched, is_terminator) = match &in_flight.awaiting {
+            Awaiting::Single(codes) => (codes.contains(&code), true),
+            Awaiting::Stream {
+                frame_codes,
+                terminator_code,
+            } => {
+                let in_stream = frame_codes.contains(&code) || code == *terminator_code;
+                (in_stream, code == *terminator_code)
             }
-            // ACK: LoRa-delivery confirmation, possibly minutes later.
-            // Match by the 4-byte ack_code we stashed at MSG_SENT time.
-            0x82 if payload.len() >= 5 => {
-                if let Ok(ack) = <[u8; 4]>::try_from(&payload[1..5])
-                    && let Some(client_id) = self.pending_acks.remove(&ack)
-                {
-                    self.send_to_client(&client_id, payload.to_vec());
-                    return true;
-                }
-            }
-            // ERROR: if a SEND_* is in flight, assume the error is for
-            // it. Best-effort under the FIFO assumption.
-            0x01 => {
-                if let Some(client_id) = self.pending_send_replies.pop_front() {
-                    self.send_to_client(&client_id, payload.to_vec());
-                    return true;
-                }
-            }
-            _ => {}
+        };
+
+        if !matched {
+            return false;
         }
-        false
+
+        let client_id = in_flight.client_id;
+
+        // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
+        // so the later 0x82 finds its way back.
+        if code == 0x06
+            && payload.len() >= 6
+            && let Ok(ack) = <[u8; 4]>::try_from(&payload[2..6])
+        {
+            self.pending_acks.insert(ack, client_id);
+        }
+
+        self.send_to_client(&client_id, payload.to_vec());
+
+        if is_terminator {
+            self.in_flight = None;
+            self.advance_queue().await;
+        }
+        true
+    }
+
+    fn try_route_ack(&mut self, code: u8, payload: &[u8]) -> bool {
+        if code != 0x82 || payload.len() < 5 {
+            return false;
+        }
+        let Ok(ack) = <[u8; 4]>::try_from(&payload[1..5]) else {
+            return false;
+        };
+        let Some(client_id) = self.pending_acks.remove(&ack) else {
+            return false;
+        };
+        self.send_to_client(&client_id, payload.to_vec());
+        true
     }
 
     async fn cache_response(&mut self, code: u8, payload: &[u8]) {
