@@ -559,10 +559,16 @@ impl Core {
                 let _ = self.state.delete_channel(idx).await;
                 let _ = self.send_to_radio(payload).await;
             }
-            _ => {
+            // Write commands that mutate radio state visible in SELF_INFO,
+            // DEVICE_INFO or BATTERY. Invalidate cached blobs so the next
+            // read forces a round-trip and repopulates them.
+            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 => {
                 self.self_info_raw = None;
                 self.device_info_raw = None;
                 self.battery_info_raw = None;
+                let _ = self.send_to_radio(payload).await;
+            }
+            _ => {
                 let _ = self.send_to_radio(payload).await;
             }
         }
