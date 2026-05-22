@@ -7,7 +7,7 @@ use anyhow::Result;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::protocol::frame::{Frame, FrameParser};
+use crate::protocol::frame::{self, FrameParser};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -136,7 +136,7 @@ async fn handle_client(
         loop {
             tokio::select! {
                 Some(payload) = direct_rx.recv() => {
-                    let framed = Frame::encode_response(&payload);
+                    let framed = frame::encode_response(&payload);
                     if tokio::io::AsyncWriteExt::write_all(&mut writer, &framed).await.is_err() {
                         break;
                     }
@@ -144,7 +144,7 @@ async fn handle_client(
                 result = broadcast_rx.recv() => {
                     match result {
                         Ok(payload) => {
-                            let framed = Frame::encode_response(&payload);
+                            let framed = frame::encode_response(&payload);
                             if tokio::io::AsyncWriteExt::write_all(&mut writer, &framed).await.is_err() {
                                 break;
                             }

@@ -905,8 +905,6 @@ impl Core {
                             DecodedValue::Integer(i) => i.to_string(),
                             DecodedValue::Float(f) => format!("{f:.2}"),
                             DecodedValue::Bool(b) => b.to_string(),
-                            DecodedValue::Bytes(b) => hex::encode(b),
-                            DecodedValue::Map(m) => format!("{m:?}"),
                         };
                         (k.clone(), val)
                     })

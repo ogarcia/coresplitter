@@ -4,43 +4,21 @@ pub const FRAME_HEADER_CLIENT: u8 = 0x3c;
 pub const FRAME_HEADER_SERVER: u8 = 0x3e;
 pub const FRAME_HEADER_SIZE: usize = 3;
 
-#[derive(Debug, Clone)]
-pub struct Frame {
-    pub header: u8,
-    pub payload: Vec<u8>,
+fn encode(header: u8, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u16;
+    let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
+    buf.push(header);
+    buf.put_u16_le(len);
+    buf.extend_from_slice(payload);
+    buf
 }
 
-impl Frame {
-    pub fn new(header: u8, payload: Vec<u8>) -> Self {
-        Self { header, payload }
-    }
+pub fn encode_response(payload: &[u8]) -> Vec<u8> {
+    encode(FRAME_HEADER_SERVER, payload)
+}
 
-    pub fn encode(&self) -> Vec<u8> {
-        let len = self.payload.len() as u16;
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + self.payload.len());
-        buf.push(self.header);
-        buf.put_u16_le(len);
-        buf.extend_from_slice(&self.payload);
-        buf
-    }
-
-    pub fn encode_response(payload: &[u8]) -> Vec<u8> {
-        let len = payload.len() as u16;
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
-        buf.push(FRAME_HEADER_SERVER);
-        buf.put_u16_le(len);
-        buf.extend_from_slice(payload);
-        buf
-    }
-
-    pub fn encode_command(payload: &[u8]) -> Vec<u8> {
-        let len = payload.len() as u16;
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
-        buf.push(FRAME_HEADER_CLIENT);
-        buf.put_u16_le(len);
-        buf.extend_from_slice(payload);
-        buf
-    }
+pub fn encode_command(payload: &[u8]) -> Vec<u8> {
+    encode(FRAME_HEADER_CLIENT, payload)
 }
 
 #[derive(Debug, Default)]
@@ -95,12 +73,6 @@ impl FrameParser {
 
         frames
     }
-
-    pub fn reset(&mut self) {
-        self.header_byte = None;
-        self.expected_len = None;
-        self.buffer.clear();
-    }
 }
 
 #[cfg(test)]
@@ -110,8 +82,7 @@ mod tests {
     #[test]
     fn test_frame_roundtrip() {
         let payload = vec![0x01, 0x02, 0x03];
-        let frame = Frame::new(FRAME_HEADER_CLIENT, payload.clone());
-        let encoded = frame.encode();
+        let encoded = encode_command(&payload);
 
         let mut parser = FrameParser::new();
         let frames = parser.feed(&encoded);
@@ -122,8 +93,7 @@ mod tests {
     #[test]
     fn test_frame_partial_feed() {
         let payload = vec![0x01, 0x02, 0x03];
-        let frame = Frame::new(FRAME_HEADER_CLIENT, payload.clone());
-        let encoded = frame.encode();
+        let encoded = encode_command(&payload);
 
         let mut parser = FrameParser::new();
         let frames1 = parser.feed(&encoded[..2]);
@@ -141,8 +111,7 @@ mod tests {
 
         for i in 0..3 {
             let payload = vec![i; 5 + i as usize];
-            let frame = Frame::new(FRAME_HEADER_CLIENT, payload);
-            all_encoded.extend_from_slice(&frame.encode());
+            all_encoded.extend_from_slice(&encode_command(&payload));
         }
 
         let frames = parser.feed(&all_encoded);

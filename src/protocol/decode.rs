@@ -6,8 +6,6 @@ pub enum DecodedValue {
     Integer(i64),
     Float(f64),
     Bool(bool),
-    Bytes(Vec<u8>),
-    Map(HashMap<String, String>),
 }
 
 pub fn decode_command_payload(code: u8, payload: &[u8]) -> Option<HashMap<String, DecodedValue>> {
@@ -486,11 +484,6 @@ fn format_entry(k: &str, v: &DecodedValue) -> String {
         DecodedValue::Integer(i) => i.to_string(),
         DecodedValue::Float(f) => format!("{f:.2}"),
         DecodedValue::Bool(b) => b.to_string(),
-        DecodedValue::Bytes(b) => hex::encode(b),
-        DecodedValue::Map(m) => {
-            let inner: Vec<String> = m.iter().map(|(ik, iv)| format!("{ik}={iv}")).collect();
-            format!("{{{}}}", inner.join(", "))
-        }
     };
     format!("{k}={val_str}")
 }

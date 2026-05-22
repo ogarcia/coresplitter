@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::protocol::frame::Frame;
+use crate::protocol::frame;
 
 use super::RadioIo;
 
@@ -49,7 +49,7 @@ pub async fn connect(host: &str, port: u16) -> Result<RadioIo> {
 
         let write_handle = tokio::spawn(async move {
             while let Some(data) = send_rx.recv().await {
-                let framed = Frame::encode_command(&data);
+                let framed = frame::encode_command(&data);
                 if let Err(e) = writer.write_all(&framed).await {
                     tracing::error!(error = %e, "tcp backend: write error");
                     break;

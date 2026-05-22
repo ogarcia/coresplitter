@@ -21,16 +21,6 @@ pub struct CachedChannel {
     pub config: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub struct CachedMessage {
-    pub id: i64,
-    pub msg_type: String,
-    pub from_key: Option<Vec<u8>>,
-    pub channel_idx: Option<i64>,
-    pub text: String,
-    pub timestamp: i64,
-}
-
 pub struct NodeState {
     pool: SqlitePool,
 }
@@ -151,13 +141,6 @@ impl NodeState {
         Ok(rows)
     }
 
-    pub async fn clear_contacts(&self) -> Result<()> {
-        sqlx::query("DELETE FROM contacts")
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     // --- Channels ---
 
     pub async fn upsert_channel(&self, channel: &CachedChannel) -> Result<()> {
@@ -207,15 +190,6 @@ impl NodeState {
         .execute(&self.pool)
         .await?;
         Ok(result.last_insert_rowid())
-    }
-
-    pub async fn get_recent_messages(&self, limit: i64) -> Result<Vec<CachedMessage>> {
-        let rows =
-            sqlx::query_as::<_, CachedMessage>("SELECT * FROM messages ORDER BY id DESC LIMIT ?1")
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows)
     }
 
     // --- Key-value store ---

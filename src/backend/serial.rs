@@ -5,7 +5,7 @@ use tokio::task::JoinHandle;
 use tokio_serial::SerialPortBuilderExt;
 
 use super::RadioIo;
-use crate::protocol::frame::Frame;
+use crate::protocol::frame;
 
 pub async fn connect(path: &str, baud: u32) -> Result<RadioIo> {
     let mut serial = tokio_serial::new(path, baud)
@@ -52,7 +52,7 @@ pub async fn connect(path: &str, baud: u32) -> Result<RadioIo> {
 
         let write_handle = tokio::spawn(async move {
             while let Some(data) = send_rx.recv().await {
-                let framed = Frame::encode_command(&data);
+                let framed = frame::encode_command(&data);
                 if let Err(e) = writer.write_all(&framed).await {
                     tracing::error!(error = %e, "serial: write error");
                     break;
