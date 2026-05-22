@@ -867,6 +867,7 @@ impl Core {
         }
 
         let client_id = in_flight.client_id;
+        let cmd_code = in_flight.cmd_code;
 
         // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
         // so the later 0x82 finds its way back.
@@ -878,6 +879,14 @@ impl Core {
         }
 
         self.send_to_client(&client_id, payload.to_vec());
+
+        // An incoming LoRa message delivered as the reply to a GET_MSG is
+        // a global event from the rest of the network's point of view:
+        // every connected client should see it. Fan out to the other
+        // clients (the originator just got it through send_to_client).
+        if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11) {
+            self.broadcast_to_others(Some(&client_id), payload);
+        }
 
         if is_terminator {
             self.in_flight = None;
