@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -59,6 +59,14 @@ pub struct Core {
     command_rx: mpsc::UnboundedReceiver<ClientCommand>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     client_channels: ClientDirectMap,
+    // Clients waiting for the immediate MSG_SENT (0x06) or ERROR (0x01)
+    // reply after a SEND_MSG / SEND_CHAN_MSG forward. FIFO: assumes the
+    // radio replies in submission order.
+    pending_send_replies: VecDeque<ClientId>,
+    // Clients waiting for the (possibly much later) LoRa-delivery ACK
+    // (0x82), keyed by the 4-byte expected_ack the radio handed back in
+    // the corresponding MSG_SENT.
+    pending_acks: HashMap<[u8; 4], ClientId>,
 }
 
 impl Core {
@@ -86,6 +94,8 @@ impl Core {
             command_rx,
             broadcast_tx,
             client_channels: Arc::new(Mutex::new(HashMap::new())),
+            pending_send_replies: VecDeque::new(),
+            pending_acks: HashMap::new(),
         })
     }
 
@@ -422,9 +432,8 @@ impl Core {
     }
 
     async fn send_to_radio(&self, data: &[u8]) -> Result<()> {
-        if let Some(ref tx) = self.radio_send_tx {
-            tx.send(data.to_vec()).context("failed to send to radio")?;
-        }
+        let tx = self.radio_send_tx.as_ref().context("radio not connected")?;
+        tx.send(data.to_vec()).context("failed to send to radio")?;
         Ok(())
     }
 
@@ -485,19 +494,24 @@ impl Core {
                 let _ = self.send_to_radio(payload).await;
             }
             0x02 if payload.len() >= 14 => {
-                if self.radio_send_tx.is_none() {
-                    tracing::warn!("radio offline, replying ERROR to SEND_MSG");
+                // Forward first; the echo, the DB insert and the
+                // pending-reply slot only happen if the radio actually
+                // got the frame.
+                if let Err(e) = self.send_to_radio(payload).await {
+                    tracing::warn!(error = %e, "forward failed, replying ERROR to SEND_MSG");
                     self.send_to_client(&cmd.client_id, vec![0x01, 0x01]);
                     return;
                 }
+                self.pending_send_replies.push_back(cmd.client_id);
+
                 let msg_type = payload[1];
                 let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
                 let text = String::from_utf8_lossy(&payload[13..]).to_string();
 
-                // Synthesize CONTACT_MSG_RECV (0x07) so other clients see the
-                // message as if it had arrived over LoRa from the radio. The
-                // from_key must be the real radio pubkey; without it we cannot
-                // produce a coherent broadcast and we only forward.
+                // Synthesize CONTACT_MSG_RECV (0x07) so other clients see
+                // the message as if it had arrived over LoRa from the
+                // radio. Needs the real radio pubkey for from_key; without
+                // it we skip the echo but the forward already happened.
                 if let Some(pk) = self.radio_pubkey {
                     let from_key = &pk[..6];
                     let mut fake = Vec::with_capacity(13 + text.len());
@@ -518,20 +532,19 @@ impl Core {
                         "no radio pubkey known, skipping synthetic broadcast for SEND_MSG"
                     );
                 }
-                let _ = self.send_to_radio(payload).await;
             }
             0x03 if payload.len() >= 8 => {
-                if self.radio_send_tx.is_none() {
-                    tracing::warn!("radio offline, replying ERROR to SEND_CHAN_MSG");
+                if let Err(e) = self.send_to_radio(payload).await {
+                    tracing::warn!(error = %e, "forward failed, replying ERROR to SEND_CHAN_MSG");
                     self.send_to_client(&cmd.client_id, vec![0x01, 0x01]);
                     return;
                 }
+                self.pending_send_replies.push_back(cmd.client_id);
+
                 let channel = payload[2] as i64;
                 let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
                 let text = String::from_utf8_lossy(&payload[7..]).to_string();
 
-                // Same as 0x02: synthesize CHANNEL_MSG_RECV (0x08) only if we
-                // know the radio pubkey to attribute it to.
                 if let Some(pk) = self.radio_pubkey {
                     let from_key = &pk[..6];
                     let mut fake = Vec::with_capacity(8 + text.len());
@@ -552,7 +565,6 @@ impl Core {
                         "no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG"
                     );
                 }
-                let _ = self.send_to_radio(payload).await;
             }
             0x20 if payload.len() > 1 => {
                 // Invalidate cached channel so next GET_CHANNEL hits the radio
@@ -696,7 +708,50 @@ impl Core {
             let _ = self.state.insert_raw_rx(resp_code, &payload).await;
         }
 
+        // Try to route correlated responses to a specific client. If the
+        // routing doesn't apply (no pending request, or this is a real
+        // push event), fall through to broadcasting it to everybody.
+        if self.try_route_correlated(resp_code, &payload) {
+            return;
+        }
+
         let _ = self.broadcast_tx.send(payload);
+    }
+
+    fn try_route_correlated(&mut self, code: u8, payload: &[u8]) -> bool {
+        match code {
+            // MSG_SENT: immediate reply to a SEND_MSG / SEND_CHAN_MSG.
+            // Record the expected_ack so we can route the later 0x82.
+            0x06 if payload.len() >= 10 => {
+                if let Some(client_id) = self.pending_send_replies.pop_front() {
+                    if let Ok(ack) = payload[2..6].try_into() {
+                        self.pending_acks.insert(ack, client_id);
+                    }
+                    self.send_to_client(&client_id, payload.to_vec());
+                    return true;
+                }
+            }
+            // ACK: LoRa-delivery confirmation, possibly minutes later.
+            // Match by the 4-byte ack_code we stashed at MSG_SENT time.
+            0x82 if payload.len() >= 5 => {
+                if let Ok(ack) = <[u8; 4]>::try_from(&payload[1..5])
+                    && let Some(client_id) = self.pending_acks.remove(&ack)
+                {
+                    self.send_to_client(&client_id, payload.to_vec());
+                    return true;
+                }
+            }
+            // ERROR: if a SEND_* is in flight, assume the error is for
+            // it. Best-effort under the FIFO assumption.
+            0x01 => {
+                if let Some(client_id) = self.pending_send_replies.pop_front() {
+                    self.send_to_client(&client_id, payload.to_vec());
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     async fn cache_response(&mut self, code: u8, payload: &[u8]) {
