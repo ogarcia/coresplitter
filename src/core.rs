@@ -16,6 +16,11 @@ use crate::protocol::decode::{
 
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Maximum age of a pending_acks entry before it is considered abandoned.
+/// LoRa retransmissions inside the radio top out around ~30 s; five minutes
+/// is comfortably above any realistic real ACK and short enough to bound
+/// memory growth from channel sends (which never produce an ACK).
+const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 
 /// Response codes that are spontaneous push events from the radio and never
 /// complete an in-flight request. They are always broadcast to every client.
@@ -131,8 +136,11 @@ pub struct Core {
     pending_queue: VecDeque<Queued>,
     // Clients waiting for the (possibly much later) LoRa-delivery ACK
     // (0x82), keyed by the 4-byte expected_ack the radio handed back in
-    // the corresponding MSG_SENT. Independent of the in_flight slot.
-    pending_acks: HashMap<[u8; 4], ClientId>,
+    // the corresponding MSG_SENT. The Instant is the insertion time,
+    // used to evict stale entries when a new ack is recorded. Channel
+    // sends (0x03) never produce an ACK, so without eviction those
+    // entries would accumulate forever.
+    pending_acks: HashMap<[u8; 4], (ClientId, Instant)>,
 }
 
 impl Core {
@@ -887,12 +895,17 @@ impl Core {
         let cmd_code = in_flight.cmd_code;
 
         // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
-        // so the later 0x82 finds its way back.
+        // so the later 0x82 finds its way back. Lazy GC: purge stale
+        // entries first so the map stays bounded (channel sends never
+        // produce an ACK, so without this they'd accumulate forever).
         if code == 0x06
             && payload.len() >= 6
             && let Ok(ack) = <[u8; 4]>::try_from(&payload[2..6])
         {
-            self.pending_acks.insert(ack, client_id);
+            let now = Instant::now();
+            self.pending_acks
+                .retain(|_, (_, inserted_at)| now.duration_since(*inserted_at) < PENDING_ACK_TTL);
+            self.pending_acks.insert(ack, (client_id, now));
         }
 
         self.send_to_client(&client_id, payload.to_vec());
@@ -919,7 +932,7 @@ impl Core {
         let Ok(ack) = <[u8; 4]>::try_from(&payload[1..5]) else {
             return false;
         };
-        let Some(client_id) = self.pending_acks.remove(&ack) else {
+        let Some((client_id, _)) = self.pending_acks.remove(&ack) else {
             return false;
         };
         self.send_to_client(&client_id, payload.to_vec());
