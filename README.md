@@ -127,19 +127,20 @@ uv run tools/test_proxy.py
 All tests run sequentially. Each cycle spawns a fresh proxy and fake radio,
 runs the tests, and cleans up.
 
-### Current tests (9 cases, 15 assertions, all PASS)
+### Current tests (10 cases, 17 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
 | 1 | Multi-client concurrent | Two clients both receive SELF_INFO; one sends a message, the other receives the broadcast |
 | 2 | SET_CHANNEL + persistence | Creates a channel, verifies SQLite persistence after reconnection |
-| 3 | Injected messages (0x08) | Periodic injector sends CHANNEL_MSG_RECV, client receives it via broadcast |
-| 4 | Contact message (0x07) | Injector sends CONTACT_MSG_RECV, client receives it via broadcast |
+| 3 | Injected channel msg via GET_MSG | Client waits for 0x83, polls with GET_MSG, gets CHANNEL_MSG_RECV (0x08) |
+| 4 | Injected contact msg via GET_MSG | Same as #3 for CONTACT_MSG_RECV (0x07) |
 | 5 | GET_MESSAGE polling | Client waits for 0x83, sends GET_MESSAGE, receives queued messages |
 | 6 | Multiple messages in order | FIFO polling: two consecutive messages have different content |
 | 7 | Long message (>133 chars) | Two clients: one sends long text, the other receives the intact broadcast |
 | 8 | Contact send (0x02) | Two clients: one sends SEND_MSG, the other receives the raw payload broadcast |
-| 9 | TCP reconnection | Kills fake radio, waits for reconnect, verifies GET_CHANNEL works |
+| 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
+| 10 | TCP reconnection | Kills fake radio, waits for reconnect, verifies GET_CHANNEL works |
 
 ### Fake radio
 

@@ -497,6 +497,11 @@ class FakeRadio:
     # -- Injection helpers -------------------------------------------------
 
     async def _injector(self, w):
+        # Mirrors what a real MeshCore node does on inbound LoRa traffic:
+        # queue the message internally and notify with MESSAGES_WAITING
+        # (0x83). The client is expected to retrieve it via GET_MSG (0x0A).
+        # No direct push of the 0x07/0x08 frame, which a real radio does
+        # not do either.
         items: list[bytes] = [
             make_chan_msg(0, "Keep alive from fake radio"),
             make_contact_msg(b"\xAA\xBB\xCC\xDD\xEE\xFF", "Hello from Alpha"),
@@ -511,11 +516,10 @@ class FakeRadio:
                 if n >= len(items):
                     n = 0
                 framed = items[n]
-                w.write(framed)
                 self._push_msg(w, framed)
                 w.write(make_messages_waiting())
                 await w.drain()
-                print(f"  <- INJECT item[{n}]: {framed[3:10].hex()}...")
+                print(f"  <- INJECT item[{n}]: queued, sent 0x83")
                 n += 1
         except asyncio.CancelledError:
             pass

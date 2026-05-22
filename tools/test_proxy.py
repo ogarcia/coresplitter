@@ -273,8 +273,20 @@ async def test_set_channel(proxy_port):
     await c.close()
 
 
+async def _wait_for_0x83(c, timeout):
+    """Wait up to `timeout` seconds for a MESSAGES_WAITING (0x83) on `c`."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        p = await c.recv(2)
+        if p is None:
+            return False
+        if len(p) and p[0] == 0x83:
+            return True
+    return False
+
+
 async def test_injected_messages(proxy_port):
-    log.info("--- Test 3: Injected messages (CHANNEL_MSG_RECV) ---")
+    log.info("--- Test 3: Injected channel msg via GET_MSG polling ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -282,28 +294,22 @@ async def test_injected_messages(proxy_port):
         await c.close()
         return
 
-    t0 = time.monotonic()
-    received = False
-    while time.monotonic() - t0 < 25:
-        p = await c.recv(3)
-        if p is None:
-            break
-        if len(p) == 0:
-            continue
-        if p[0] == 0x08:
-            received = True
-            break
+    if not await _wait_for_0x83(c, 10):
+        fail("did not receive MESSAGES_WAITING (0x83) in 10s")
+        await c.close()
+        return
 
-    if received:
-        ok("CHANNEL_MSG_RECV received via broadcast")
+    msg = await c.get_message()
+    if msg and msg[0] == 0x08:
+        ok("GET_MSG after 0x83 returns CHANNEL_MSG_RECV (0x08)")
     else:
-        fail("did not receive CHANNEL_MSG_RECV in 25s")
+        fail(f"GET_MSG returned: {msg.hex() if msg else 'None'}")
 
     await c.close()
 
 
 async def test_contact_msg_received(proxy_port):
-    log.info("--- Test 5: Contact message (0x07) received ---")
+    log.info("--- Test 4: Injected contact msg via GET_MSG polling ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -311,28 +317,28 @@ async def test_contact_msg_received(proxy_port):
         await c.close()
         return
 
-    t0 = time.monotonic()
-    received = False
-    while time.monotonic() - t0 < 25:
-        p = await c.recv(3)
-        if p is None:
+    # The injector cycles through items; the 0x07 contact msg is item 1.
+    # Keep polling on every 0x83 until we hit a 0x07 (or timeout).
+    deadline = time.monotonic() + 30
+    got_07 = False
+    while time.monotonic() < deadline:
+        if not await _wait_for_0x83(c, 10):
             break
-        if len(p) == 0:
-            continue
-        if p[0] == 0x07:
-            received = True
+        msg = await c.get_message()
+        if msg and msg[0] == 0x07:
+            got_07 = True
             break
 
-    if received:
-        ok("CONTACT_MSG_RECV (0x07) received via broadcast")
+    if got_07:
+        ok("GET_MSG returns CONTACT_MSG_RECV (0x07)")
     else:
-        fail("did not receive 0x07 in 25s")
+        fail("did not retrieve a 0x07 via GET_MSG in 30s")
 
     await c.close()
 
 
 async def test_get_message_polling(proxy_port):
-    log.info("--- Test 6: GET_MESSAGE polling (0x0A) ---")
+    log.info("--- Test 5: GET_MESSAGE polling (0x0A) ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -378,7 +384,7 @@ async def test_get_message_polling(proxy_port):
 
 
 async def test_multiple_messages_order(proxy_port):
-    log.info("--- Test 7: Multiple messages in order ---")
+    log.info("--- Test 6: Multiple messages in order ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -412,7 +418,7 @@ async def test_multiple_messages_order(proxy_port):
 
 
 async def test_long_message(proxy_port):
-    log.info("--- Test 8: Long message (>133 chars) ---")
+    log.info("--- Test 7: Long message (>133 chars) ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
     r1 = await c1.appstart()
@@ -450,7 +456,7 @@ async def test_long_message(proxy_port):
 
 
 async def test_send_contact_msg(proxy_port):
-    log.info("--- Test 9: Send contact message (0x02) ---")
+    log.info("--- Test 8: Send contact message (0x02) ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
     r1 = await c1.appstart()
@@ -533,6 +539,68 @@ async def test_reconnect_tcp(proxy_port):
         fail(f"proxy does not respond after reconnection (r={r}, raw=...)")
 
     await c.close()
+
+
+async def test_get_msg_fans_out(proxy_port):
+    log.info("--- Test 9: GET_MSG reply fans out to other clients ---")
+    c1 = await connect_client(port=proxy_port)
+    c2 = await connect_client(port=proxy_port)
+
+    r1 = await c1.appstart()
+    r2 = await c2.appstart()
+    if not r1 or not r2:
+        fail("SELF_INFO failed for one or both clients")
+        await c1.close()
+        await c2.close()
+        return
+
+    # Wait for an injector 0x83 on c1 (c2 sees it too but we don't act on it).
+    if not await _wait_for_0x83(c1, 10):
+        fail("c1 did not receive MESSAGES_WAITING (0x83) in 10s")
+        await c1.close()
+        await c2.close()
+        return
+
+    # c1 polls. Expect a real message (not NO_MORE_MSGS).
+    msg_c1 = await c1.get_message()
+    if not msg_c1 or msg_c1[0] not in (0x07, 0x08):
+        fail(f"c1 GET_MSG returned: {msg_c1.hex() if msg_c1 else 'None'}")
+        await c1.close()
+        await c2.close()
+        return
+    ok(f"c1 GET_MSG → 0x{msg_c1[0]:02x}")
+
+    # c2 should see the same message via fan-out broadcast (no GET_MSG of
+    # its own). Drain c2 until we find a matching 0x07/0x08. Need a
+    # generous window because c2 will also see broadcast 0x83 from the
+    # injector and we have to drain past those.
+    got_fanout = None
+    seen = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 10:
+        p = await c2.recv(1)
+        if p is None:
+            break
+        if len(p) == 0:
+            continue
+        seen.append(f"0x{p[0]:02x}")
+        if p[0] in (0x07, 0x08):
+            got_fanout = p
+            break
+    log.info("  c2 saw frames: %s", seen)
+
+    if got_fanout is None:
+        fail("c2 did not receive the message via fan-out")
+    elif got_fanout == msg_c1:
+        ok("c2 receives the same frame via fan-out broadcast")
+    else:
+        fail(
+            f"c2 received a frame but bytes differ:\n"
+            f"  c1: {msg_c1.hex()}\n  c2: {got_fanout.hex()}"
+        )
+
+    await c1.close()
+    await c2.close()
 
 
 # --- Harness ---
@@ -625,6 +693,7 @@ async def main():
     await test_multiple_messages_order(proxy_port)
     await test_long_message(proxy_port)
     await test_send_contact_msg(proxy_port)
+    await test_get_msg_fans_out(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL
