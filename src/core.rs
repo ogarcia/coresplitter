@@ -408,26 +408,17 @@ impl Core {
     }
 
     async fn sync_from_radio(&mut self) {
-        tracing::info!("syncing contacts and channels from physical radio");
+        tracing::info!("requesting contacts and channels from physical radio");
 
-        // Query contacts
-        let get_contacts = vec![0x04];
-        let _ = self.send_to_radio(&get_contacts).await;
-
-        // Give the radio a moment to respond before querying channels
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Query channels 0..max_channels. The radio responds with CHANNEL_INFO
-        // for configured channels and nothing for unconfigured ones.
+        // Fire-and-forget: tx all read commands without waiting. Responses
+        // arrive on radio_recv_rx and are cached by cache_response() once
+        // the main loop starts draining the channel.
+        let _ = self.send_to_radio(&[0x04]).await;
         for idx in 0..self.max_channels {
-            let get_channel = vec![0x1F, idx];
-            if self.send_to_radio(&get_channel).await.is_err() {
+            if self.send_to_radio(&[0x1F, idx]).await.is_err() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-
-        tracing::info!("sync complete");
     }
 
     async fn send_to_radio(&self, data: &[u8]) -> Result<()> {
