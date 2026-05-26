@@ -55,7 +55,8 @@ enum Awaiting {
 
 #[derive(Debug)]
 struct InFlight {
-    client_id: ClientId,
+    /// `None` for internal sync commands (sync_from_radio); `Some` for client requests.
+    client_id: Option<ClientId>,
     cmd_code: u8,
     sent_at: Instant,
     awaiting: Awaiting,
@@ -63,7 +64,8 @@ struct InFlight {
 
 #[derive(Debug)]
 struct Queued {
-    client_id: ClientId,
+    /// `None` for internal sync commands; `Some` for client requests.
+    client_id: Option<ClientId>,
     payload: Vec<u8>,
 }
 
@@ -186,8 +188,8 @@ impl Core {
             self.reconnect_radio().await;
         }
 
-        // Sync state from the physical radio (contacts, channels, etc.)
-        self.sync_from_radio().await;
+        // Queue sync commands so they serialize with any early client requests.
+        self.sync_from_radio();
 
         // Load persisted blobs from kv_store if not already set (radio offline fallback)
         if self.self_info_raw.is_none()
@@ -352,6 +354,19 @@ impl Core {
     async fn reconnect_radio(&mut self) {
         self.radio_send_tx = None;
 
+        // Fail any request that was in flight when the radio dropped.
+        if let Some(f) = self.in_flight.take()
+            && let Some(cid) = f.client_id
+        {
+            self.send_to_client(&cid, vec![0x01, 0x01]);
+        }
+        // Fail all queued client requests; discard internal sync entries.
+        while let Some(q) = self.pending_queue.pop_front() {
+            if let Some(cid) = q.client_id {
+                self.send_to_client(&cid, vec![0x01, 0x01]);
+            }
+        }
+
         let mut delay = Duration::from_secs(1);
         let max_delay = Duration::from_secs(60);
 
@@ -382,7 +397,7 @@ impl Core {
                     match self.initialize_radio().await {
                         Ok(()) => {
                             tracing::info!("radio re-initialized successfully");
-                            self.sync_from_radio().await;
+                            self.sync_from_radio();
                             return;
                         }
                         Err(e) => {
@@ -498,18 +513,54 @@ impl Core {
         }
     }
 
-    async fn sync_from_radio(&mut self) {
-        tracing::info!("requesting contacts and channels from physical radio");
+    fn sync_from_radio(&mut self) {
+        tracing::info!("queuing contacts and channels sync from physical radio");
 
-        // Fire-and-forget: tx all read commands without waiting. Responses
-        // arrive on radio_recv_rx and are cached by cache_response() once
-        // the main loop starts draining the channel.
-        let _ = self.send_to_radio(&[0x04]).await;
+        // Enqueue through the normal serialization path so sync responses
+        // can never interleave with in-flight client requests.
+        // client_id=None: responses are cached but not forwarded to any client.
+        self.pending_queue.push_back(Queued {
+            client_id: None,
+            payload: vec![0x04],
+        });
         for idx in 0..self.max_channels {
-            if self.send_to_radio(&[0x1F, idx]).await.is_err() {
-                break;
-            }
+            self.pending_queue.push_back(Queued {
+                client_id: None,
+                payload: vec![0x1F, idx],
+            });
         }
+        // Kick off the first entry if the radio is idle.
+        if self.in_flight.is_none() {
+            let _ = self.advance_queue_sync();
+        }
+    }
+
+    /// Synchronous (non-async) queue advance used during sync_from_radio
+    /// before the main loop is running. Pops one entry and sends it directly.
+    fn advance_queue_sync(&mut self) -> Option<()> {
+        while let Some(next) = self.pending_queue.pop_front() {
+            if let Some(cid) = next.client_id
+                && !self.client_is_alive(&cid)
+            {
+                continue;
+            }
+            let cmd_code = next.payload[0];
+            let tx = self.radio_send_tx.as_ref()?;
+            if tx.send(next.payload.clone()).is_err() {
+                if let Some(cid) = next.client_id {
+                    self.send_to_client(&cid, vec![0x01, 0x01]);
+                }
+                return None;
+            }
+            self.in_flight = Some(InFlight {
+                client_id: next.client_id,
+                cmd_code,
+                sent_at: Instant::now(),
+                awaiting: awaiting_for(cmd_code),
+            });
+            return Some(());
+        }
+        None
     }
 
     async fn send_to_radio(&self, data: &[u8]) -> Result<()> {
@@ -532,7 +583,8 @@ impl Core {
         }
 
         // 2. Anything else goes through the serialized radio queue.
-        self.enqueue_or_dispatch(cmd.client_id, cmd.payload).await;
+        self.enqueue_or_dispatch(Some(cmd.client_id), cmd.payload)
+            .await;
     }
 
     /// Returns true if the command was fully served from cache without
@@ -585,7 +637,7 @@ impl Core {
 
     /// Enqueue the command if the radio is busy with a previous request,
     /// otherwise dispatch it immediately.
-    async fn enqueue_or_dispatch(&mut self, client_id: ClientId, payload: Vec<u8>) {
+    async fn enqueue_or_dispatch(&mut self, client_id: Option<ClientId>, payload: Vec<u8>) {
         if self.in_flight.is_none() {
             self.dispatch_to_radio(client_id, payload).await;
         } else {
@@ -594,25 +646,33 @@ impl Core {
     }
 
     /// Forward a command to the radio and set up the in_flight slot.
-    /// On forward failure replies ERROR to the client and leaves the slot
-    /// free. On success performs post-forward side effects (echo synthesis
-    /// for SEND_*, cache invalidation for setters, etc).
-    async fn dispatch_to_radio(&mut self, client_id: ClientId, payload: Vec<u8>) {
+    /// On forward failure replies ERROR to the originating client (if any)
+    /// and leaves the slot free. On success performs post-forward side
+    /// effects (echo synthesis for SEND_*, cache invalidation for setters).
+    async fn dispatch_to_radio(&mut self, client_id: Option<ClientId>, payload: Vec<u8>) {
         let cmd_code = payload[0];
 
         if let Err(e) = self.send_to_radio(&payload).await {
             tracing::warn!(error = %e, cmd = format_args!("0x{cmd_code:02x}"), "forward failed");
-            self.send_to_client(&client_id, vec![0x01, 0x01]);
+            if let Some(cid) = client_id {
+                self.send_to_client(&cid, vec![0x01, 0x01]);
+            }
             return;
         }
 
+        if let Some(cid) = client_id {
+            match cmd_code {
+                0x02 if payload.len() >= 14 => {
+                    self.synthesize_contact_echo(&cid, &payload).await;
+                }
+                0x03 if payload.len() >= 8 => {
+                    self.synthesize_channel_echo(&cid, &payload).await;
+                }
+                _ => {}
+            }
+        }
+
         match cmd_code {
-            0x02 if payload.len() >= 14 => {
-                self.synthesize_contact_echo(&client_id, &payload).await;
-            }
-            0x03 if payload.len() >= 8 => {
-                self.synthesize_channel_echo(&client_id, &payload).await;
-            }
             0x20 if payload.len() > 1 => {
                 let idx = payload[1] as i64;
                 let _ = self.state.delete_channel(idx).await;
@@ -635,12 +695,15 @@ impl Core {
     }
 
     /// Pop and dispatch the next queued command for which the originating
-    /// client is still connected. Stops at the first one successfully
-    /// dispatched, or when the queue empties.
+    /// client is still connected. Internal sync entries (client_id=None)
+    /// are always eligible. Stops at the first one successfully dispatched,
+    /// or when the queue empties.
     async fn advance_queue(&mut self) {
         while let Some(next) = self.pending_queue.pop_front() {
-            if !self.client_is_alive(&next.client_id) {
-                tracing::debug!(client = %next.client_id, "dropping queued request: client gone");
+            if let Some(cid) = next.client_id
+                && !self.client_is_alive(&cid)
+            {
+                tracing::debug!(client = %cid, "dropping queued request: client gone");
                 continue;
             }
             self.dispatch_to_radio(next.client_id, next.payload).await;
@@ -720,12 +783,19 @@ impl Core {
             return;
         }
         let f = self.in_flight.take().expect("checked Some above");
-        tracing::warn!(
-            client = %f.client_id,
-            cmd = format_args!("0x{:02x}", f.cmd_code),
-            "in_flight timeout, replying ERROR"
-        );
-        self.send_to_client(&f.client_id, vec![0x01, 0x01]);
+        if let Some(cid) = f.client_id {
+            tracing::warn!(
+                client = %cid,
+                cmd = format_args!("0x{:02x}", f.cmd_code),
+                "in_flight timeout, replying ERROR"
+            );
+            self.send_to_client(&cid, vec![0x01, 0x01]);
+        } else {
+            tracing::warn!(
+                cmd = format_args!("0x{:02x}", f.cmd_code),
+                "in_flight sync timeout, discarding"
+            );
+        }
         self.advance_queue().await;
     }
 
@@ -894,28 +964,31 @@ impl Core {
         let client_id = in_flight.client_id;
         let cmd_code = in_flight.cmd_code;
 
-        // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
-        // so the later 0x82 finds its way back. Lazy GC: purge stale
-        // entries first so the map stays bounded (channel sends never
-        // produce an ACK, so without this they'd accumulate forever).
-        if code == 0x06
-            && payload.len() >= 6
-            && let Ok(ack) = <[u8; 4]>::try_from(&payload[2..6])
-        {
-            let now = Instant::now();
-            self.pending_acks
-                .retain(|_, (_, inserted_at)| now.duration_since(*inserted_at) < PENDING_ACK_TTL);
-            self.pending_acks.insert(ack, (client_id, now));
-        }
+        if let Some(cid) = client_id {
+            // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
+            // so the later 0x82 finds its way back. Lazy GC: purge stale
+            // entries first so the map stays bounded (channel sends never
+            // produce an ACK, so without this they'd accumulate forever).
+            if code == 0x06
+                && payload.len() >= 6
+                && let Ok(ack) = <[u8; 4]>::try_from(&payload[2..6])
+            {
+                let now = Instant::now();
+                self.pending_acks.retain(|_, (_, inserted_at)| {
+                    now.duration_since(*inserted_at) < PENDING_ACK_TTL
+                });
+                self.pending_acks.insert(ack, (cid, now));
+            }
 
-        self.send_to_client(&client_id, payload.to_vec());
+            self.send_to_client(&cid, payload.to_vec());
+        }
 
         // An incoming LoRa message delivered as the reply to a GET_MSG is
         // a global event from the rest of the network's point of view:
         // every connected client should see it. Fan out to the other
         // clients (the originator just got it through send_to_client).
         if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11) {
-            self.broadcast_to_others(Some(&client_id), payload);
+            self.broadcast_to_others(client_id.as_ref(), payload);
         }
 
         if is_terminator {
