@@ -22,12 +22,16 @@ the physical radio — the proxy acts as a **faithful mirror**.
 ```
 
 1. Proxy connects to the physical radio and syncs contacts and channels
-   into SQLite at startup.
+   into SQLite at startup (and again after each reconnect). The sync
+   commands are queued through the same FIFO as client commands so their
+   responses never interleave with a real client request.
 2. Opens a TCP server for companion clients to connect to.
 3. Client commands are served from cache when possible (SELF_INFO,
    DEVICE_INFO, BATTERY, GET_CONTACTS, GET_CHANNEL); the rest are
    serialized through a FIFO queue and forwarded one at a time to the
    radio. The radio's reply is routed back to the originating client.
+   If the radio disconnects, any in-flight or queued client request is
+   failed immediately with ERROR.
 4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG): after the radio
    accepts the forward, a synthetic CONTACT_MSG_RECV / CHANNEL_MSG_RECV
    is echoed to the other clients so they see the message as if it
