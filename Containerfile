@@ -1,23 +1,30 @@
 # syntax=docker/dockerfile:1.7
 #
-# Two-stage build. The builder compiles against musl in alpine; the
-# runtime ships just the static binary on top of a minimal alpine.
-# The result is a ~15-20 MB image with no glibc or OpenSSL runtime
-# dependency — every C bit (libsqlite3, etc.) is bundled and every
-# TLS bit (rustls) is pure Rust.
+# Local build (compiles from source):
+#   podman build -t coresplitter:dev .
 #
-# Pinning notes:
-#   * Alpine is pinned to 3.23 in both stages so a new base image
-#     never silently changes the runtime.
-#   * Rust is left floating within the 1.x channel, mirroring the
-#     `dtolnay/rust-toolchain@stable` posture of the CI workflow.
-#     Switch to `rust:1.<N>-alpine3.23` if bit-exact reproducibility
-#     of the toolchain is required.
+# CI build (binary pre-compiled into artifacts/<arch>/, arch = amd64|arm64 to
+# match Docker's TARGETARCH; buildx picks the right one per platform):
+#   podman build --build-arg BUILDER=prebuilt .
+#
+# Either way the result is a static musl binary on top of a minimal alpine,
+# with no glibc or OpenSSL runtime dependency: SQLite is bundled.
 
-FROM rust:1-alpine3.23 AS builder
+# ARG before the first FROM so it is a global build argument. Default 'builder'
+# (local compile); CI passes --build-arg BUILDER=prebuilt to use artifacts/.
+ARG BUILDER=builder
 
-# musl-dev pulls in the C toolchain bits libsqlite3-sys needs to
-# bundle SQLite; the rest of the stack is pure Rust.
+# Base-image versions. Defaults mirror versions.env (the single source of
+# truth); CI overrides them with --build-arg.
+ARG ALPINE_VERSION=3.23
+ARG RUST_VERSION=1
+
+# ── Stage 1a: compile from source (default local path) ──────────────────────
+
+FROM docker.io/rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS builder
+
+# musl-dev pulls in the C toolchain bits libsqlite3-sys needs to bundle
+# SQLite; the rest of the stack is pure Rust.
 # NOTE: add `dbus-dev` here if building with --features ble.
 RUN apk add --no-cache musl-dev
 
@@ -32,16 +39,29 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/coresplitter /usr/bin/coresplitter && \
     strip /usr/bin/coresplitter
 
-# ----------------------------------------------------------------------
+# ── Stage 1b: pre-built binary injected from CI (artifacts/ in context) ──────
 
-FROM alpine:3.23
+# TARGETARCH (amd64/arm64) is set automatically by buildx per target platform;
+# re-declare it here to use it in COPY. The artifacts/<arch>/ layout is produced
+# by the container.yml build matrix.
+FROM scratch AS prebuilt
+ARG TARGETARCH
+COPY --chmod=0755 artifacts/${TARGETARCH}/coresplitter /usr/bin/coresplitter
+
+# ── Stage 1c: indirection — points to 'builder' or 'prebuilt' via build arg ──
+
+FROM ${BUILDER} AS bins
+
+# ── Stage 2: runtime ────────────────────────────────────────────────────────
+
+FROM docker.io/alpine:${ALPINE_VERSION} AS runtime
 
 RUN addgroup -S -g 10001 coresplitter && \
     adduser -S -G coresplitter -u 10001 coresplitter && \
     mkdir -p /etc/coresplitter /var/lib/coresplitter && \
     chown -R coresplitter:coresplitter /var/lib/coresplitter
 
-COPY --from=builder /usr/bin/coresplitter /usr/bin/coresplitter
+COPY --from=bins /usr/bin/coresplitter /usr/bin/coresplitter
 
 USER coresplitter
 WORKDIR /var/lib/coresplitter

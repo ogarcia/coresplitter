@@ -6,3 +6,6 @@ target/
 AGENTS.md
 .github/
 tools/
+
+# Pre-built binaries (artifacts/<arch>/coresplitter) are injected by CI with
+# --build-arg BUILDER=prebuilt, so artifacts/ is intentionally NOT excluded.

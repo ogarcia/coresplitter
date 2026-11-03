@@ -2,18 +2,21 @@ name: Container
 
 on:
   push:
-    branches: [master, main]
-    # Match bare semver tags like `0.1.0`, `1.2.3-rc1`. GAIA does not
-    # use a `v` prefix on tags.
+    branches: [master]
+    # Bare semver tags: 0.1.0, 1.2.3-rc1 (no "v" prefix).
     tags: ["[0-9]*"]
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
+      - "tools/**"
   pull_request:
     paths:
       - "Containerfile"
-      - "Dockerfile"
       - ".dockerignore"
       - "Cargo.toml"
       - "Cargo.lock"
       - "src/**"
+      - "versions.env"
       - ".github/workflows/container.yml"
 
 env:
@@ -21,21 +24,86 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # ── Compile the musl binary once per arch (native runners) ─────────────────
   build:
-    name: Build and publish
+    name: Compile binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    # aarch64 musl on the arm runner is a cross build from its gnu host, so the
+    # cc crate (bundled SQLite) looks for aarch64-linux-musl-gcc, which
+    # musl-tools doesn't ship. Point the C compiler and the linker at musl-gcc.
+    # These vars are target-scoped, so they are inert for the x86_64 job.
+    env:
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+
+      - name: Build
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir -p artifacts/${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/coresplitter artifacts/${{ matrix.arch }}/
+          strip artifacts/${{ matrix.arch }}/coresplitter
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.arch }}
+          path: artifacts/
+          retention-days: 1
+
+  # ── Build and push the multi-arch image ────────────────────────────────────
+  image:
+    name: Build and push image
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Load build versions
+        shell: bash
+        run: grep -E '^[A-Za-z_]+=' versions.env >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: artifacts/
+          merge-multiple: true
+
+      # QEMU lets buildx run the emulated bits of the non-native platform — here
+      # only the runtime stage's user setup (a few seconds); the binary is
+      # pre-compiled, so nothing heavy runs under emulation.
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -43,7 +111,7 @@ jobs:
 
       - name: Extract image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -54,9 +122,15 @@ jobs:
             type=sha,format=short
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
+          file: Containerfile
+          platforms: linux/amd64,linux/arm64
+          target: runtime
+          build-args: |
+            BUILDER=prebuilt
+            ALPINE_VERSION=${{ env.ALPINE_VERSION }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
