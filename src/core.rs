@@ -316,10 +316,16 @@ impl Core {
         tracing::info!("starting coresplitter (MeshCore client multiplexer + cache)");
 
         if let Err(e) = self.connect_backend().await {
-            tracing::warn!(error = %e, "initial radio connection failed, will retry");
+            tracing::warn!(
+                error = format_args!("{e:#}"),
+                "initial radio connection failed, will retry"
+            );
             self.reconnect_radio().await;
         } else if let Err(e) = self.initialize_radio().await {
-            tracing::warn!(error = %e, "initial radio initialization failed, will retry");
+            tracing::warn!(
+                error = format_args!("{e:#}"),
+                "initial radio initialization failed, will retry"
+            );
             self.radio_send_tx = None;
             self.reconnect_radio().await;
         } else {
@@ -581,13 +587,16 @@ impl Core {
                             return;
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "re-initialization failed, will retry");
+                            tracing::warn!(
+                                error = format_args!("{e:#}"),
+                                "re-initialization failed, will retry"
+                            );
                             self.radio_send_tx = None;
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "reconnection failed");
+                    tracing::warn!(error = format_args!("{e:#}"), "reconnection failed");
                 }
             }
 
