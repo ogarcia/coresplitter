@@ -1,9 +1,17 @@
 name: CI
 
 on:
+  # Only what cargo fmt, clippy and test look at: docs, tools and assets
+  # don't spend a run.
   push:
     branches: [master]
+    paths: &code
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
   pull_request:
+    paths: *code
 
 env:
   CARGO_TERM_COLOR: always
