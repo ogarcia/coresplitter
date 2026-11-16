@@ -1,11 +1,37 @@
+<div align="center">
+
+<img src="assets/coresplitter-icon.svg" alt="Core Splitter" width="128" height="128">
+
 # Core Splitter
 
-[MeshCore](https://meshcore.io) **client multiplexer with cache**. Speaks the
-companion protocol on both sides: it connects to a physical radio (serial,
-BLE, or TCP) and serves a TCP interface to multiple concurrent companion
-clients. Contacts, channels, SELF_INFO, DEVICE_INFO and BATTERY are cached in
-SQLite so cold reads don't hit the radio. Every client sees the same state as
-the physical radio — the proxy acts as a **faithful mirror**.
+**[MeshCore](https://meshcore.io) client multiplexer with cache**
+
+*One radio, many companion clients, all seeing the same node.*
+
+[![CI](https://img.shields.io/github/actions/workflow/status/ogarcia/coresplitter/ci.yml?branch=master&style=for-the-badge&label=CI&logo=githubactions&logoColor=white)](https://github.com/ogarcia/coresplitter/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0-5b3a9e?style=for-the-badge)](LICENSE)
+<br>
+[![Rust](https://img.shields.io/badge/Rust-single%20static%20binary-e66100?style=for-the-badge&logo=rust&logoColor=white)](#build)
+[![SQLite](https://img.shields.io/badge/SQLite-bundled-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](#how-it-works)
+[![MeshCore companion protocol](https://img.shields.io/badge/MeshCore-companion%20protocol-8a6cc8?style=for-the-badge)](https://meshcore.io)
+[![Radio over TCP · serial · BLE](https://img.shields.io/badge/radio-TCP%20%C2%B7%20serial%20%C2%B7%20BLE-5b3a9e?style=for-the-badge)](#usage)
+[![Container image](https://img.shields.io/badge/container-ghcr.io-2496ed?style=for-the-badge&logo=docker&logoColor=white)](https://github.com/ogarcia/coresplitter/pkgs/container/coresplitter)
+
+[How it works](#how-it-works) · [Usage](#usage) · [Container](#container) · [Test suite](#test-suite)
+
+</div>
+
+---
+
+Core Splitter speaks the companion protocol on both sides: it connects to a
+physical radio (serial, BLE, or TCP) and serves a TCP interface to multiple
+concurrent companion clients. Contacts, channels, SELF_INFO, DEVICE_INFO and
+BATTERY are cached in SQLite so cold reads don't hit the radio. Every client
+sees the same state as the physical radio — the proxy acts as a **faithful
+mirror**.
+
+Sibling of [Tastic Splitter](https://github.com/ogarcia/tasticsplitter),
+which does the same for Meshtastic.
 
 ## How it works
 
