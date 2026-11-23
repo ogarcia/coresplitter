@@ -725,19 +725,37 @@ async def test_remove_contact(proxy_port):
         await c.close()
         return
 
+    async def remove(key):
+        await c.send(b"\x0f" + key)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5:
+            p = await c.recv(2)
+            if p is None:
+                return None
+            if len(p) and p[0] in (0x00, 0x01):
+                return p
+        return None
+
+    # The fake radio refuses to remove Alpha: the cache must keep it.
+    alpha_key = bytes.fromhex(
+        "aabbccdd0011aabbccdd0011aabbccdd0011aabbccdd0011aabbccdd0011aabb"
+    )
+    reply = await remove(alpha_key)
+    if reply != b"\x01\x02":
+        fail(f"refused REMOVE_CONTACT reply: {reply.hex() if reply else 'None'}")
+        await c.close()
+        return
+    names = await _get_contact_names(c)
+    if not names or "Alpha Test" not in names:
+        fail(f"contact the radio refused to remove left the cache: {names}")
+        await c.close()
+        return
+    ok("refused REMOVE_CONTACT → ERROR, contact kept in cache")
+
     bravo_key = bytes.fromhex(
         "1122334455661122334455661122334455661122334455661122334455661122"
     )
-    await c.send(b"\x0f" + bravo_key)
-    reply = None
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < 5:
-        p = await c.recv(2)
-        if p is None:
-            break
-        if len(p) and p[0] in (0x00, 0x01):
-            reply = p
-            break
+    reply = await remove(bravo_key)
     if reply is None or reply[0] != 0x00:
         fail(f"REMOVE_CONTACT reply: {reply.hex() if reply else 'None'}")
         await c.close()

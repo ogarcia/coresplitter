@@ -509,7 +509,9 @@ class FakeRadio:
                     (i for i, c in enumerate(DEFAULT_CONTACTS) if c["key"] == key),
                     None,
                 )
-                if idx is not None:
+                # Alpha can't be removed: "not found, or unable to remove"
+                # (ERR_CODE_NOT_FOUND) with the contact still there.
+                if idx is not None and key != DEFAULT_CONTACTS[0]["key"]:
                     removed = DEFAULT_CONTACTS.pop(idx)
                     print(f"     -> Contacto borrado: {removed['name']!r}")
                     w.write(respond_ok())

@@ -282,7 +282,7 @@ runs the tests, and cleans up.
 | 7 | Long message (>133 chars) | Two clients: one sends long text, the other receives the intact broadcast |
 | 8 | Contact send (0x02) | Two clients: one sends SEND_MSG, the other receives the raw payload broadcast |
 | 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
-| 10 | REMOVE_CONTACT purges cache | Removes a contact; the next cached GET_CONTACTS no longer lists it |
+| 10 | REMOVE_CONTACT purges cache | Removes a contact; the next cached GET_CONTACTS no longer lists it. One the radio refuses to remove stays in the cache |
 | 11 | Cached GET_CONTACTS mirrors radio | Cached CONTACT frames keep flags, path and lastmod; the `since` filter, START count and END lastmod follow the firmware |
 | 12 | ADD_UPDATE_CONTACT refreshes cache | After the radio accepts a contact update, the cached list shows its new name, path and lastmod |
 | 13 | Rejected send not echoed | SEND_CHAN_MSG to an unknown channel gets ERROR and no echo reaches the other client |

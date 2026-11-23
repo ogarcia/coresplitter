@@ -884,13 +884,6 @@ impl Core {
         }
 
         match cmd_code {
-            // REMOVE_CONTACT: drop it from the cache too, otherwise the
-            // next cached GET_CONTACTS would resurrect it.
-            0x0F if payload.len() >= 33 => {
-                if let Err(e) = self.state.delete_contact(&payload[1..33]).await {
-                    tracing::warn!(error = %e, "failed to delete cached contact");
-                }
-            }
             0x20 if payload.len() > 1 => {
                 let idx = payload[1] as i64;
                 let _ = self.state.delete_channel(idx).await;
@@ -941,6 +934,13 @@ impl Core {
                     tracing::warn!(error = %e, "failed to record contacts sync time");
                 }
             }
+            // REMOVE_CONTACT: drop it from the cache too, otherwise the
+            // next cached GET_CONTACTS would resurrect it.
+            0x0F if payload.len() >= 33 => {
+                if let Err(e) = self.state.delete_contact(&payload[1..33]).await {
+                    tracing::warn!(error = %e, "failed to delete cached contact");
+                }
+            }
             // ADD_UPDATE_CONTACT, RESET_PATH: [cmd, pubkey(32), ...]
             0x09 | 0x0D if payload.len() >= 33 => self.queue_contact_refresh(&payload[1..33]),
             // IMPORT_CONTACT takes an advert blob; the key isn't at a fixed
@@ -971,6 +971,22 @@ impl Core {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Log what a refused command leaves undone. The cache keeps what it
+    /// had: the radio didn't change it either.
+    fn on_command_refused(&self, done: &InFlight, reply: &[u8]) {
+        let err = reply.get(1).copied().unwrap_or(0);
+        // REMOVE_CONTACT only fails with ERR_CODE_NOT_FOUND (2): the radio
+        // doesn't hold that contact, while our copy may outlive it.
+        if done.payload[0] == 0x0F && done.payload.len() >= 33 {
+            tracing::warn!(
+                client = ?done.origin,
+                err,
+                key = %hex::encode(&done.payload[1..33]),
+                "radio refused to remove contact, kept in cache"
+            );
         }
     }
 
@@ -1476,6 +1492,8 @@ impl Core {
             let done = self.in_flight.take().expect("checked Some above");
             if code != 0x01 {
                 self.on_command_accepted(&done).await;
+            } else {
+                self.on_command_refused(&done, payload);
             }
             self.advance_queue().await;
         } else if let Some(f) = self.in_flight.as_mut() {
