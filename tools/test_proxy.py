@@ -738,6 +738,59 @@ async def test_reconnect_tcp(proxy_port):
     await c.close()
 
 
+async def test_request_jumps_sync(proxy_port):
+    log.info("--- Test 22: A client request does not wait behind the sync ---")
+    # Bring the radio back slow on GET_CHANNEL: the sync the proxy runs on
+    # reconnecting then takes 40 x 0.25 s = 10 s.
+    await stop_fake()
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        try:
+            probe = await connect_client(port=proxy_port)
+            await probe.close()
+            await asyncio.sleep(0.2)
+        except (ConnectionRefusedError, OSError):
+            break
+    await start_fake(port=fake_port, extra=("--channel-delay", "0.25"))
+    if not fake_proc:
+        fail("could not restart fake radio")
+        return
+    if not await wait_for_port(proxy_port, timeout=20):
+        fail("proxy did not reopen the frontend after reconnection")
+        return
+
+    c = await connect_client(port=proxy_port)
+    if not await c.appstart():
+        fail("SELF_INFO failed")
+        await c.close()
+        return
+
+    from fake_radio import DEFAULT_CONTACTS
+    alpha = DEFAULT_CONTACTS[0]["key"]
+    t0 = time.monotonic()
+    await c.send(b"\x1e" + alpha)
+    reply = None
+    while time.monotonic() - t0 < 15:
+        p = await c.recv(1)
+        if p and p[0] in (0x03, 0x01):
+            reply = p
+            break
+    took = time.monotonic() - t0
+    if reply and reply[0] == 0x03 and took < 3:
+        ok(f"request answered during the sync ({took:.1f} s)")
+    else:
+        fail(f"request waited behind the sync ({took:.1f} s, "
+             f"r={reply.hex() if reply else 'None'})")
+
+    # A cached read keeps its place and is still answered.
+    r = await c.get_channel(0)
+    if r and r[0] == 0x12:
+        ok("GET_CHANNEL answered while the sync runs")
+    else:
+        fail(f"GET_CHANNEL during the sync: {r.hex() if r else 'None'}")
+    await c.close()
+
+
 async def test_get_msg_fans_out(proxy_port):
     log.info("--- Test 9: GET_MSG reply fans out to other clients ---")
     c1 = await connect_client(port=proxy_port)
@@ -1230,7 +1283,7 @@ fake_port = None
 proxy_port = None
 proxy_proc = None
 
-async def start_fake(port=None):
+async def start_fake(port=None, extra=()):
     global fake_proc, fake_pid, fake_port
     if port is None:
         fake_port = await find_free_port()
@@ -1238,7 +1291,7 @@ async def start_fake(port=None):
         fake_port = port
     fake_proc = await asyncio.create_subprocess_exec(
         sys.executable, os.path.join(os.path.dirname(__file__), "fake_radio.py"),
-        "--port", str(fake_port), "--inject",
+        "--port", str(fake_port), "--inject", *extra,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -1327,6 +1380,7 @@ async def main():
     await test_late_reply_not_misrouted(proxy_port)
     await test_unconfirmed_message_resent(proxy_port)
     await test_reconnect_tcp(proxy_port)
+    await test_request_jumps_sync(proxy_port)
 
     total = PASS + FAIL
     log.info("=" * 40)

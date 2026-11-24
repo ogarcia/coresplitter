@@ -281,9 +281,12 @@ def make_messages_waiting() -> bytes:
 
 
 class FakeRadio:
-    def __init__(self, inject: bool = False):
+    def __init__(self, inject: bool = False, channel_delay: float = 0.0):
         self.channels: list[dict] = list(DEFAULT_CHANNELS)
         self.inject = inject
+        # Seconds to wait before each GET_CHANNEL reply, to make the proxy's
+        # sync after connecting slow (as over BLE or serial).
+        self.channel_delay = channel_delay
         # Set by DEVICE_QUERY; picks the layout of queued messages, as in
         # the firmware (app_target_ver).
         self.app_target_ver = 0
@@ -546,6 +549,8 @@ class FakeRadio:
                 await w.drain()
 
             case 0x1F:
+                if self.channel_delay:
+                    await asyncio.sleep(self.channel_delay)
                 idx = rest[0] if rest else 0
                 ch = next((c for c in self.channels if c["idx"] == idx), None)
                 if idx >= MAX_CHANNELS:
@@ -663,17 +668,19 @@ async def main():
     ap.add_argument("--port", type=int, default=None, help="TCP port (default: 5050)")
     ap.add_argument("--serial", action="store_true", help="Serial PTY mode instead of TCP")
     ap.add_argument("--inject", action="store_true", help="Inject fake incoming messages")
+    ap.add_argument("--channel-delay", type=float, default=0.0,
+                    help="Seconds to wait before each GET_CHANNEL reply")
     args = ap.parse_args()
 
     if args.serial:
-        radio = FakeRadio(inject=args.inject)
+        radio = FakeRadio(inject=args.inject, channel_delay=args.channel_delay)
         print("Fake radio en modo SERIAL (PTY)  (inject={})".format("on" if args.inject else "off"))
         print("  Canales:", [c["name"] for c in DEFAULT_CHANNELS])
         print("  Contactos:", [c["name"] for c in DEFAULT_CONTACTS])
         await radio.run_serial()
     else:
         port = args.port or PORT
-        radio = FakeRadio(inject=args.inject)
+        radio = FakeRadio(inject=args.inject, channel_delay=args.channel_delay)
         server = await asyncio.start_server(radio.handle_client, HOST, port)
 
         addr = ", ".join(str(s.getsockname()) for s in server.sockets)

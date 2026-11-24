@@ -200,6 +200,20 @@ struct Queued {
     payload: Vec<u8>,
 }
 
+/// Whether `try_serve_from_cache` may answer this command without the radio.
+/// Keep in sync with its arms: a command missing here only loses the
+/// queue ordering in `enqueue_or_dispatch`, it is still served correctly.
+fn cache_served_command(cmd_code: u8) -> bool {
+    matches!(
+        cmd_code,
+        0x01    // APP_START     -> SELF_INFO
+        | 0x04  // GET_CONTACTS  -> contacts table
+        | 0x14  // GET_BATTERY
+        | 0x16  // DEVICE_QUERY  -> DEVICE_INFO
+        | 0x1F // GET_CHANNEL
+    )
+}
+
 /// Map a command to the shape of the radio's reply, as written by the
 /// companion firmware (examples/companion_radio/MyMesh.cpp).
 fn awaiting_for(payload: &[u8]) -> Awaiting {
@@ -853,7 +867,10 @@ impl Core {
         }
 
         // 1. Cache-only paths: serve from RAM / SQLite, never touch the radio.
-        if self.try_serve_from_cache(cmd_code, &cmd).await {
+        if self
+            .try_serve_from_cache(&cmd.client_id, &cmd.payload)
+            .await
+        {
             if cmd_code == 0x01 {
                 self.notify_missed(&cmd.client_id);
             }
@@ -872,23 +889,23 @@ impl Core {
 
     /// Returns true if the command was fully served from cache without
     /// forwarding to the radio.
-    async fn try_serve_from_cache(&self, cmd_code: u8, cmd: &ClientCommand) -> bool {
-        match cmd_code {
+    async fn try_serve_from_cache(&self, client_id: &ClientId, payload: &[u8]) -> bool {
+        match payload[0] {
             0x01 => {
                 if let Some(ref blob) = self.self_info_raw {
-                    self.send_to_client(&cmd.client_id, blob.clone());
+                    self.send_to_client(client_id, blob.clone());
                     return true;
                 }
             }
             0x16 => {
                 if let Some(ref blob) = self.device_info_raw {
-                    self.send_to_client(&cmd.client_id, blob.clone());
+                    self.send_to_client(client_id, blob.clone());
                     return true;
                 }
             }
             0x14 => {
                 if let Some(ref blob) = self.battery_info_raw {
-                    self.send_to_client(&cmd.client_id, blob.clone());
+                    self.send_to_client(client_id, blob.clone());
                     return true;
                 }
             }
@@ -897,18 +914,16 @@ impl Core {
                     && !contacts.is_empty()
                 {
                     // Optional 'since' filter: only contacts modified after it.
-                    let since = cmd
-                        .payload
+                    let since = payload
                         .get(1..5)
                         .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-                    self.respond_contacts(&cmd.client_id, &contacts, since)
-                        .await;
+                    self.respond_contacts(client_id, &contacts, since).await;
                     return true;
                 }
             }
             0x1F => {
-                let requested_idx = if cmd.payload.len() > 1 {
-                    cmd.payload[1] as i64
+                let requested_idx = if payload.len() > 1 {
+                    payload[1] as i64
                 } else {
                     -1
                 };
@@ -922,13 +937,13 @@ impl Core {
                         max_channels = self.max_channels,
                         "GET_CHANNEL out of range, replying locally"
                     );
-                    self.send_to_client(&cmd.client_id, vec![0x01, 0x02]);
+                    self.send_to_client(client_id, vec![0x01, 0x02]);
                     return true;
                 }
                 if let Ok(channels) = self.state.get_channels().await
                     && let Some(ch) = channels.iter().find(|c| c.idx == requested_idx)
                 {
-                    self.respond_channel_info(&cmd.client_id, ch).await;
+                    self.respond_channel_info(client_id, ch).await;
                     return true;
                 }
             }
@@ -939,12 +954,35 @@ impl Core {
 
     /// Enqueue the command if the radio is busy with a previous request,
     /// otherwise dispatch it immediately.
+    ///
+    /// A client's request jumps ahead of the internal entries in the queue
+    /// (the sync after connecting to the radio, the offline drain). That sync
+    /// is a GET_CONTACTS plus one GET_CHANNEL per slot and the radio answers
+    /// one command at a time, so on a slow link it holds the queue for
+    /// seconds with work no client asked for. The request goes before the
+    /// first internal entry but after any client already queued, so clients
+    /// keep their own arrival order.
+    ///
+    /// The reads the cache can answer keep their place: the sync is filling
+    /// the very entries that answer them, and `advance_queue` tries the cache
+    /// again when their turn comes, so they never reach the radio at all.
     async fn enqueue_or_dispatch(&mut self, client_id: Option<ClientId>, payload: Vec<u8>) {
         if self.in_flight.is_none() {
             self.dispatch_to_radio(client_id, payload).await;
-        } else {
-            self.pending_queue.push_back(Queued { client_id, payload });
+            return;
         }
+        let entry = Queued { client_id, payload };
+        if client_id.is_some()
+            && !cache_served_command(entry.payload[0])
+            && let Some(pos) = self
+                .pending_queue
+                .iter()
+                .position(|queued| queued.client_id.is_none())
+        {
+            self.pending_queue.insert(pos, entry);
+            return;
+        }
+        self.pending_queue.push_back(entry);
     }
 
     /// Forward a command to the radio and set up the in_flight slot.
@@ -1103,6 +1141,17 @@ impl Core {
                 && !self.client_is_alive(&cid)
             {
                 tracing::debug!(client = %cid, "dropping queued request: client gone");
+                continue;
+            }
+            // It missed the cache on arrival, but a sync that was ahead of
+            // it may have filled the cache since.
+            if let Some(cid) = next.client_id
+                && cache_served_command(next.payload[0])
+                && self.try_serve_from_cache(&cid, &next.payload).await
+            {
+                if next.payload[0] == 0x01 {
+                    self.notify_missed(&cid);
+                }
                 continue;
             }
             self.dispatch_to_radio(next.client_id, next.payload).await;

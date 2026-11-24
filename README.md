@@ -317,6 +317,7 @@ runs the tests, and cleans up.
 | 19 | Radio queue fetched while offline | With no client connected the proxy fetches and stores the radio's messages; the app gets them when it reconnects |
 | 20 | Late reply not misrouted | A GET_CONTACT_BY_KEY the radio answers after the in-flight timeout gets ERROR, and its late reply does not reach the request queued behind it |
 | 21 | Unconfirmed message sent again | A client that gets a message and disconnects without sending another command gets it again on reconnect; once confirmed it is not sent again |
+| 22 | Request jumps the sync | With the radio slow on GET_CHANNEL, a request sent while the proxy resyncs after reconnecting is answered at once instead of waiting behind the 40 channel reads |
 
 ### Fake radio
 
