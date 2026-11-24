@@ -13,6 +13,10 @@ pub async fn connect(host: &str, port: u16) -> Result<RadioIo> {
     let stream = TcpStream::connect(&addr)
         .await
         .context(format!("failed to connect to TCP backend at {addr}"))?;
+    // Harmless while one command is in flight at a time, but two writes
+    // without a reply in between would otherwise wait out Nagle against the
+    // peer's delayed ACK (up to ~40 ms). The frontend already sets it.
+    let _ = stream.set_nodelay(true);
 
     let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (recv_tx, recv_rx) = mpsc::unbounded_channel::<Vec<u8>>();

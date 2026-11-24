@@ -22,6 +22,8 @@ const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 /// CONTACT frame: code + pubkey(32) + type + flags + out_path_len +
 /// out_path(64) + name(32) + last_advert + lat + lon + lastmod (4 each).
 const CONTACT_FRAME_LEN: usize = 148;
+/// How many sent payloads `seen_send_before` remembers.
+const MAX_RECENT_ECHOES: usize = 160;
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the database is purged according to the retention settings.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
@@ -269,6 +271,9 @@ pub struct Core {
     // closes login/status/telemetry requests, which never produce an
     // ACK, so without eviction those entries would accumulate forever.
     pending_acks: HashMap<[u8; 4], (ClientId, Instant)>,
+    // Payloads of the SEND_* commands already echoed, so a resend is echoed
+    // and stored only once (see `seen_send_before`).
+    recent_echoes: VecDeque<Vec<u8>>,
     // Identified clients, keyed by connection. Entries of disconnected
     // clients are dropped lazily (see follow_head).
     sessions: HashMap<ClientId, Session>,
@@ -307,6 +312,7 @@ impl Core {
             in_flight: None,
             pending_queue: VecDeque::new(),
             pending_acks: HashMap::new(),
+            recent_echoes: VecDeque::new(),
             sessions: HashMap::new(),
             protocol_versions: HashMap::new(),
         })
@@ -846,6 +852,19 @@ impl Core {
                 } else {
                     -1
                 };
+                // The firmware refuses every idx >= MAX_GROUP_CHANNELS with
+                // ERR_CODE_NOT_FOUND, so answer that here and keep the doomed
+                // request off the radio. An in-range slot the cache lacks still
+                // goes to the radio: it may hold a channel we have not seen.
+                if requested_idx >= i64::from(self.max_channels) {
+                    tracing::debug!(
+                        idx = requested_idx,
+                        max_channels = self.max_channels,
+                        "GET_CHANNEL out of range, replying locally"
+                    );
+                    self.send_to_client(&cmd.client_id, vec![0x01, 0x02]);
+                    return true;
+                }
                 if let Ok(channels) = self.state.get_channels().await
                     && let Some(ch) = channels.iter().find(|c| c.idx == requested_idx)
                 {
@@ -888,8 +907,19 @@ impl Core {
                 let idx = payload[1] as i64;
                 let _ = self.state.delete_channel(idx).await;
             }
-            // Setters that mutate SELF_INFO / DEVICE_INFO / BATTERY.
-            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 => {
+            // Setters that mutate a cached blob. Clearing it means the next
+            // client to ask re-reads it from the radio.
+            //
+            //   SELF_INFO:   0x08 name, 0x0B radio, 0x0C tx power, 0x0E coords,
+            //                0x15 tuning, 0x26 other params, 0x33 factory reset
+            //   DEVICE_INFO: 0x0B repeat flag, 0x25 BLE pin, 0x33 reset,
+            //                0x3D path hash mode (a trailing byte of the blob)
+            //   all of them: 0x42 RUN_CLI_COMMAND. Its `set name`, `set radio`,
+            //                `set tx`, `set lat`/`set lon`, `set pin`... reach
+            //                the same fields as the CMD_SET_* handlers. Cleared
+            //                on any CLI command: a `get` costs one re-read, a
+            //                `set` left cached would be served stale forever.
+            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 | 0x3D | 0x42 => {
                 self.self_info_raw = None;
                 self.device_info_raw = None;
                 self.battery_info_raw = None;
@@ -1172,6 +1202,24 @@ impl Core {
         self.client_channels.lock().unwrap().contains_key(client_id)
     }
 
+    /// Whether this send was already echoed; records it if not.
+    ///
+    /// A client retrying a send reuses its timestamp, which the firmware mixes
+    /// into the packet so a retransmission is recognisable: its `wasSeen`
+    /// table drops the copy, so peers get the message once. An identical
+    /// payload is therefore never a new message, only a retry. The window
+    /// matches the firmware's own dup table (MAX_PACKET_HASHES).
+    fn seen_send_before(&mut self, payload: &[u8]) -> bool {
+        if self.recent_echoes.iter().any(|p| p.as_slice() == payload) {
+            return true;
+        }
+        if self.recent_echoes.len() == MAX_RECENT_ECHOES {
+            self.recent_echoes.pop_front();
+        }
+        self.recent_echoes.push_back(payload.to_vec());
+        false
+    }
+
     /// Synthesize a CONTACT_MSG_RECV (0x07) for the rest of the clients so
     /// they see this message as if it had arrived over LoRa from the radio.
     async fn synthesize_contact_echo(
@@ -1180,6 +1228,10 @@ impl Core {
         origin: Option<&(u16, String)>,
         payload: &[u8],
     ) {
+        if self.seen_send_before(payload) {
+            tracing::debug!(client = %sender, "not echoing a resent contact message");
+            return;
+        }
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_MSG");
             return;
@@ -1218,6 +1270,10 @@ impl Core {
         origin: Option<&(u16, String)>,
         payload: &[u8],
     ) {
+        if self.seen_send_before(payload) {
+            tracing::debug!(client = %sender, "not echoing a resent channel message");
+            return;
+        }
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG");
             return;
@@ -1435,9 +1491,17 @@ impl Core {
             let _ = self.broadcast_tx.send(payload);
             return;
         }
-        // 4. A reply nobody is waiting for: typically the late answer to a
-        //    request that already timed out. Handing it to the clients would
-        //    only make them take it as the reply to something else.
+        // 4. A message frame no request claimed (e.g. the late reply to a
+        //    GET_MSG that already timed out). The radio pops each message
+        //    from its queue only once, so dropping it would lose it for
+        //    everybody: broadcast it like any inbound traffic.
+        if matches!(resp_code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
+            let _ = self.broadcast_tx.send(payload);
+            return;
+        }
+        // 5. Any other reply nobody is waiting for: typically the late answer
+        //    to a request that already timed out. Handing it to the clients
+        //    would only make them take it as the reply to something else.
         tracing::warn!(
             code = format_args!("0x{resp_code:02x}"),
             "dropping unsolicited radio response"
@@ -1484,7 +1548,8 @@ impl Core {
         // a global event from the rest of the network's point of view:
         // every connected client should see it. Fan out to the other
         // clients (the originator just got it through send_to_client).
-        if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11) {
+        // CHANNEL_DATA_RECV (0x1B) is inbound group traffic too.
+        if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
             self.broadcast_to_others(client_id.as_ref(), payload);
         }
 

@@ -290,6 +290,7 @@ runs the tests, and cleans up.
 | 15 | Own messages not replayed | A client that sends and disconnects does not get its own message back on reconnect |
 | 16 | Same app on two ports | Two copies of the same app on different ports each get the missed message |
 | 17 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
+| 18 | Resent message echoed once | A SEND_CHAN_MSG retried with the same timestamp reaches the other client only once |
 
 ### Fake radio
 

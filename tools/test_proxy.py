@@ -508,6 +508,42 @@ async def test_send_contact_msg(proxy_port):
     await c2.close()
 
 
+async def test_resend_echoed_once(proxy_port):
+    log.info("--- Test 18: A resent message is echoed once ---")
+    c1 = await connect_client(port=proxy_port)
+    c2 = await connect_client(port=proxy_port)
+    if not await c1.appstart() or not await c2.appstart():
+        fail("SELF_INFO failed for one or both clients")
+        await c1.close()
+        await c2.close()
+        return
+
+    # A retry reuses the timestamp: same payload, same packet on air.
+    ts = int(time.time())
+    for _ in range(2):
+        if not await c1.send_chan_msg(0, "sent twice", ts=ts):
+            fail("SEND_CHAN_MSG did not return OK")
+            await c1.close()
+            await c2.close()
+            return
+
+    echoes = 0
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 2:
+        p = await c2.recv(0.5)
+        if p is None:
+            break
+        if len(p) and p[0] == 0x08 and b"sent twice" in p:
+            echoes += 1
+    if echoes == 1:
+        ok("resent SEND_CHAN_MSG reaches the other client once")
+    else:
+        fail(f"resent SEND_CHAN_MSG echoed {echoes} times")
+
+    await c1.close()
+    await c2.close()
+
+
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
     log.info("--- Test 17: TCP disconnection + reconnection ---")
@@ -1146,6 +1182,7 @@ async def main():
     await test_own_messages_not_replayed(proxy_port)
     await test_same_app_two_ports(proxy_port, proxy_port2)
     await test_message_layout_per_version(proxy_port)
+    await test_resend_echoed_once(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL
