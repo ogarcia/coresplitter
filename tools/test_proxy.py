@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -542,6 +543,46 @@ async def test_resend_echoed_once(proxy_port):
 
     await c1.close()
     await c2.close()
+
+
+async def test_drain_while_offline(proxy_port, data_dir):
+    log.info("--- Test 19: Messages fetched while nobody is connected ---")
+    c = await connect_client(port=proxy_port)
+    if not await c.appstart("drain-app"):
+        fail("SELF_INFO failed")
+        await c.close()
+        return
+    await c.close()
+
+    # The fake radio queues a message and sends 0x83 every 6 s. With no
+    # client connected, only the proxy itself can fetch it.
+    def newest():
+        with sqlite3.connect(os.path.join(data_dir, "state.db")) as db:
+            return db.execute("SELECT id, frame FROM messages ORDER BY id DESC LIMIT 1").fetchone()
+
+    before = newest()
+    head = before[0] if before else 0
+    row = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 15:
+        await asyncio.sleep(0.5)
+        row = newest()
+        if row and row[0] > head:
+            break
+    if not row or row[0] <= head:
+        fail("no message fetched from the radio while nobody was connected")
+        return
+    ok("proxy fetches the radio's queue while nobody is connected")
+
+    # The frame was stored in its v3 or v1 layout; match on its tail.
+    text = bytes(row[1])[-12:]
+    c = await connect_client(port=proxy_port)
+    await c.appstart("drain-app")
+    if await _drain_for_text(c, text, polls=8):
+        ok("reconnecting app gets the message fetched in its absence")
+    else:
+        fail("message fetched while offline was not replayed")
+    await c.close()
 
 
 async def test_reconnect_tcp(proxy_port):
@@ -1183,6 +1224,7 @@ async def main():
     await test_same_app_two_ports(proxy_port, proxy_port2)
     await test_message_layout_per_version(proxy_port)
     await test_resend_echoed_once(proxy_port)
+    await test_drain_while_offline(proxy_port, DATA_DIR)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL

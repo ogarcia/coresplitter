@@ -77,6 +77,14 @@ pub struct Cli {
     #[arg(long, env = "CORESPLITTER_RECORD_RADIO_RX")]
     pub record_radio_rx: bool,
 
+    /// Don't fetch the radio's queued messages while no client is connected
+    #[arg(
+        long = "no-drain-offline",
+        action = clap::ArgAction::SetFalse,
+        env = "CORESPLITTER_DRAIN_OFFLINE"
+    )]
+    pub drain_offline: bool,
+
     /// Days to keep stored messages (0 = forever)
     #[arg(
         long,
@@ -145,6 +153,7 @@ impl Cli {
             event_log_level,
             event_log_json: self.json,
             record_radio_rx: self.record_radio_rx,
+            drain_offline: self.drain_offline,
             retention: Retention {
                 messages_days: self.messages_retention_days,
                 raw_rx_days: self.raw_rx_retention_days,
@@ -153,5 +162,25 @@ impl Cli {
             },
             new_client_backlog: self.new_client_backlog,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn drain_offline_is_on_unless_disabled() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().drain_offline;
+        // SAFETY: the only test touching this variable.
+        unsafe { std::env::remove_var("CORESPLITTER_DRAIN_OFFLINE") };
+        assert!(parse(&["coresplitter"]));
+        assert!(!parse(&["coresplitter", "--no-drain-offline"]));
+        unsafe { std::env::set_var("CORESPLITTER_DRAIN_OFFLINE", "false") };
+        assert!(!parse(&["coresplitter"]));
+        unsafe { std::env::set_var("CORESPLITTER_DRAIN_OFFLINE", "true") };
+        assert!(parse(&["coresplitter"]));
+        unsafe { std::env::remove_var("CORESPLITTER_DRAIN_OFFLINE") };
     }
 }

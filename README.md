@@ -89,6 +89,13 @@ which does the same for Meshtastic.
    official app) look identical on one port; give each its own port
    with `--tcp-frontend-port 5000,5001`. What a never-seen client gets
    is set with `CORESPLITTER_NEW_CLIENT_BACKLOG`.
+8. Nobody connected: the radio only keeps 16 incoming messages until a
+   client fetches them, and when full it starts dropping them. While no
+   client is connected the proxy fetches them itself, on every
+   MESSAGES_WAITING and every 30 seconds, and stores them for the
+   clients' next connection. Turn it off with `--no-drain-offline` or
+   `CORESPLITTER_DRAIN_OFFLINE=false`; the messages then stay on the
+   radio for the next client to fetch.
 
 ## Requirements
 
@@ -176,6 +183,7 @@ cargo run --release --features ble -- \
 | `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `CORESPLITTER_LOG_JSON` | Enable JSON event logging |
 | `CORESPLITTER_RECORD_RADIO_RX` | Record all raw radio RX to database |
+| `CORESPLITTER_DRAIN_OFFLINE` | Fetch the radio's messages while no client is connected (default: true) |
 | `CORESPLITTER_MESSAGES_RETENTION_DAYS` | Days to keep stored messages, 0 = forever (default: 0) |
 | `CORESPLITTER_RAW_RX_RETENTION_DAYS` | Days to keep raw_rx recordings, 0 = forever (default: 7) |
 | `CORESPLITTER_CLIENTS_RETENTION_DAYS` | Days a client may stay away before it is forgotten, 0 = never (default: 180) |
@@ -291,6 +299,7 @@ runs the tests, and cleans up.
 | 16 | Same app on two ports | Two copies of the same app on different ports each get the missed message |
 | 17 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
 | 18 | Resent message echoed once | A SEND_CHAN_MSG retried with the same timestamp reaches the other client only once |
+| 19 | Radio queue fetched while offline | With no client connected the proxy fetches and stores the radio's messages; the app gets them when it reconnects |
 
 ### Fake radio
 

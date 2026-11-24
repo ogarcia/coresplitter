@@ -22,6 +22,10 @@ const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 /// CONTACT frame: code + pubkey(32) + type + flags + out_path_len +
 /// out_path(64) + name(32) + last_advert + lat + lon + lastmod (4 each).
 const CONTACT_FRAME_LEN: usize = 148;
+/// Fallback for `drain_if_unattended` when no MESSAGES_WAITING arrives:
+/// messages queued before the proxy connected, or left behind by the last
+/// client to leave.
+const OFFLINE_DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// How many sent payloads `seen_send_before` remembers.
 const MAX_RECENT_ECHOES: usize = 160;
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -230,6 +234,9 @@ pub struct CoreConfig {
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
     pub record_radio_rx: bool,
+    /// Fetch the radio's message queue while no client is connected. See
+    /// `drain_if_unattended`.
+    pub drain_offline: bool,
     pub retention: Retention,
     pub new_client_backlog: Backlog,
 }
@@ -392,6 +399,8 @@ impl Core {
         // First tick fires immediately: maintenance also runs at startup.
         let mut maintenance_tick = tokio::time::interval(MAINTENANCE_INTERVAL);
         maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut drain_tick = tokio::time::interval(OFFLINE_DRAIN_INTERVAL);
+        drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -420,6 +429,9 @@ impl Core {
                 }
                 _ = maintenance_tick.tick() => {
                     self.run_maintenance().await;
+                }
+                _ = drain_tick.tick(), if self.config.drain_offline => {
+                    self.drain_if_unattended().await;
                 }
             }
         }
@@ -1454,6 +1466,34 @@ impl Core {
         self.send_to_client(client_id, payload);
     }
 
+    /// Fetch the radio's queued messages while no client is connected.
+    ///
+    /// The radio keeps at most 16 inbound messages (OFFLINE_QUEUE_SIZE) until
+    /// a companion asks for them; once full it drops the oldest channel
+    /// message, or the new one if all are direct. With nobody polling, a
+    /// quiet night is enough to lose traffic. Each message fetched here is
+    /// stored like any other (`cache_response`) and replayed to every app
+    /// when it next connects. Connected clients poll on their own.
+    async fn drain_if_unattended(&mut self) {
+        let already = self
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| f.client_id.is_none() && f.cmd_code() == 0x0A)
+            || self
+                .pending_queue
+                .iter()
+                .any(|q| q.client_id.is_none() && q.payload == [0x0A]);
+        if !self.config.drain_offline
+            || already
+            || self.radio_send_tx.is_none()
+            || !self.client_channels.lock().unwrap().is_empty()
+        {
+            return;
+        }
+        tracing::debug!("no clients connected, fetching queued messages");
+        self.enqueue_or_dispatch(None, vec![0x0A]).await;
+    }
+
     async fn handle_radio_rx(&mut self, payload: Vec<u8>) {
         if payload.is_empty() {
             return;
@@ -1489,6 +1529,9 @@ impl Core {
                 }
             }
             let _ = self.broadcast_tx.send(payload);
+            if resp_code == 0x83 {
+                self.drain_if_unattended().await;
+            }
             return;
         }
         // 4. A message frame no request claimed (e.g. the late reply to a
@@ -1555,6 +1598,18 @@ impl Core {
 
         if is_terminator {
             let done = self.in_flight.take().expect("checked Some above");
+            // An internal poll that got a message: there may be more, so ask
+            // again until the radio says NO_MORE_MSGS. Ahead of the queue, so
+            // each message is stored before anything else is sent.
+            if client_id.is_none()
+                && cmd_code == 0x0A
+                && matches!(code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B)
+            {
+                self.pending_queue.push_front(Queued {
+                    client_id: None,
+                    payload: vec![0x0A],
+                });
+            }
             if code != 0x01 {
                 self.on_command_accepted(&done).await;
             } else {
@@ -1752,6 +1807,26 @@ impl Core {
                     .await
                 {
                     tracing::warn!(error = %e, "failed to cache V3 channel message");
+                }
+            }
+            // CHANNEL_DATA_RECV: [code, snr, res(2), channel_idx, path_len,
+            // data_type(2), data_len, data...]. No timestamp on the frame.
+            // Stored like the text messages so an app that wasn't there
+            // when it was popped still gets it.
+            0x1B if payload.len() >= 9 => {
+                if let Err(e) = self
+                    .store_message(NewMessage {
+                        msg_type: "channel_data",
+                        from_key: None,
+                        channel_idx: Some(i64::from(payload[4])),
+                        text: "",
+                        timestamp: chrono::Utc::now().timestamp(),
+                        frame: payload,
+                        origin: None,
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to cache channel data");
                 }
             }
             0x12 if payload.len() >= 50 => {
