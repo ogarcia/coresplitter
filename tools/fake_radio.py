@@ -25,6 +25,11 @@ import tty
 HOST = "0.0.0.0"
 PORT = 5050
 MAX_CHANNELS = 40  # advertised in DEVICE_INFO, as MAX_GROUP_CHANNELS
+# GET_CONTACT_BY_KEY of this key is answered late, past the proxy's
+# in-flight timeout, like a radio busy with its own work. Commands are
+# handled in order, so whatever was sent after it waits too.
+SLOW_KEY = bytes([0x5A] * 32)
+SLOW_REPLY_SECS = 17
 
 # ---------------------------------------------------------------------------
 # Default test data
@@ -534,6 +539,8 @@ class FakeRadio:
                 await w.drain()
 
             case 0x1E:
+                if rest[:32] == SLOW_KEY:
+                    await asyncio.sleep(SLOW_REPLY_SECS)
                 c = find_contact(rest[:32])
                 w.write(contact_frame(c) if c else respond_error(2))
                 await w.drain()

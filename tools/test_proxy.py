@@ -585,6 +585,46 @@ async def test_drain_while_offline(proxy_port, data_dir):
     await c.close()
 
 
+async def test_late_reply_not_misrouted(proxy_port):
+    log.info("--- Test 20: A late reply is not handed to the next request ---")
+    c1 = await connect_client(port=proxy_port)
+    c2 = await connect_client(port=proxy_port)
+    if not await c1.appstart() or not await c2.appstart():
+        fail("SELF_INFO failed for one or both clients")
+        await c1.close()
+        await c2.close()
+        return
+
+    # The radio answers c1's lookup (NOT_FOUND) after the proxy has given
+    # up on it, and only then the lookup c2 queued behind it.
+    from fake_radio import DEFAULT_CONTACTS, SLOW_KEY
+    alpha = DEFAULT_CONTACTS[0]["key"]
+    await c1.send(b"\x1e" + SLOW_KEY)
+    await asyncio.sleep(0.5)
+    await c2.send(b"\x1e" + alpha)
+
+    async def first_reply(c, timeout):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            p = await c.recv(1)
+            if p and p[0] in (0x03, 0x01):
+                return p
+        return None
+
+    r1, r2 = await asyncio.gather(first_reply(c1, 25), first_reply(c2, 25))
+    if r1 == b"\x01\x01":
+        ok("timed-out GET_CONTACT_BY_KEY gets ERROR")
+    else:
+        fail(f"timed-out GET_CONTACT_BY_KEY: {r1.hex() if r1 else 'None'}")
+    if r2 and r2[0] == 0x03 and r2[1:33] == alpha:
+        ok("next request gets its own reply, not the late one")
+    else:
+        fail(f"next request got: {r2.hex() if r2 else 'None'}")
+
+    await c1.close()
+    await c2.close()
+
+
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
     log.info("--- Test 17: TCP disconnection + reconnection ---")
@@ -1225,6 +1265,7 @@ async def main():
     await test_message_layout_per_version(proxy_port)
     await test_resend_echoed_once(proxy_port)
     await test_drain_while_offline(proxy_port, DATA_DIR)
+    await test_late_reply_not_misrouted(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL

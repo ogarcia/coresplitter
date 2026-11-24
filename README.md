@@ -56,6 +56,9 @@ which does the same for Meshtastic.
    DEVICE_INFO, BATTERY, GET_CONTACTS, GET_CHANNEL); the rest are
    serialized through a FIFO queue and forwarded one at a time to the
    radio. The radio's reply is routed back to the originating client.
+   A request the radio leaves unanswered for 15 seconds gets ERROR; if
+   its reply turns up later it is dropped, so it never reaches the next
+   request as if it were its answer.
    If the radio disconnects, any in-flight or queued client request is
    failed immediately with ERROR, every client connection is closed and
    the TCP frontend stops listening until the radio is back. MeshCore
@@ -300,6 +303,7 @@ runs the tests, and cleans up.
 | 17 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
 | 18 | Resent message echoed once | A SEND_CHAN_MSG retried with the same timestamp reaches the other client only once |
 | 19 | Radio queue fetched while offline | With no client connected the proxy fetches and stores the radio's messages; the app gets them when it reconnects |
+| 20 | Late reply not misrouted | A GET_CONTACT_BY_KEY the radio answers after the in-flight timeout gets ERROR, and its late reply does not reach the request queued behind it |
 
 ### Fake radio
 

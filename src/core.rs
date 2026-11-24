@@ -18,7 +18,19 @@ use crate::protocol::decode::{
 /// How long the radio may stay silent on an in-flight request. Measured
 /// from the last frame of the reply, so a long GET_CONTACTS stream over a
 /// slow link (BLE, serial) isn't cut off as long as frames keep coming.
-const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The radio serves the companion link between its own radio work, so a
+/// busy node can hold a reply back for seconds (6.8 s seen in the field).
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A reply slower than this is the radio stalling, not a round trip: the
+/// early warning for the stall that eventually trips IN_FLIGHT_TIMEOUT.
+const SLOW_REPLY_WARN: Duration = Duration::from_secs(5);
+/// How long a timed-out command waits for the reply the radio still owes
+/// it (see `Ghost`). A late reply lands well within this; it only bounds
+/// the rare reply that is lost on the link, which would otherwise keep
+/// swallowing the answers of later commands.
+const GHOST_TTL: Duration = Duration::from_secs(30);
+/// Upper bound on outstanding ghosts, for a radio that stopped answering.
+const MAX_GHOSTS: usize = 8;
 /// CONTACT frame: code + pubkey(32) + type + flags + out_path_len +
 /// out_path(64) + name(32) + last_advert + lat + lon + lastmod (4 each).
 const CONTACT_FRAME_LEN: usize = 148;
@@ -146,6 +158,19 @@ impl InFlight {
     fn cmd_code(&self) -> u8 {
         self.payload[0]
     }
+}
+
+/// A command that timed out, whose reply the radio still owes.
+///
+/// The radio answers in order, so an owed reply lands before the reply to
+/// any command sent after it. Left unaccounted, it would be matched against
+/// whatever is in flight and handed to a client that never asked for it,
+/// something that cannot happen with the app talking to the radio directly.
+#[derive(Debug)]
+struct Ghost {
+    cmd_code: u8,
+    awaiting: Awaiting,
+    since: Instant,
 }
 
 /// A connected client that has identified itself with APP_START.
@@ -281,6 +306,8 @@ pub struct Core {
     // Payloads of the SEND_* commands already echoed, so a resend is echoed
     // and stored only once (see `seen_send_before`).
     recent_echoes: VecDeque<Vec<u8>>,
+    // Timed-out commands whose reply has not arrived yet (see `Ghost`).
+    ghosts: VecDeque<Ghost>,
     // Identified clients, keyed by connection. Entries of disconnected
     // clients are dropped lazily (see follow_head).
     sessions: HashMap<ClientId, Session>,
@@ -320,6 +347,7 @@ impl Core {
             pending_queue: VecDeque::new(),
             pending_acks: HashMap::new(),
             recent_echoes: VecDeque::new(),
+            ghosts: VecDeque::new(),
             sessions: HashMap::new(),
             protocol_versions: HashMap::new(),
         })
@@ -426,6 +454,7 @@ impl Core {
                 }
                 _ = timeout_tick.tick() => {
                     self.check_in_flight_timeout().await;
+                    self.expire_ghosts();
                 }
                 _ = maintenance_tick.tick() => {
                     self.run_maintenance().await;
@@ -563,6 +592,8 @@ impl Core {
         {
             self.send_to_client(&cid, vec![0x01, 0x01]);
         }
+        // A new link owes nothing for commands sent on the old one.
+        self.ghosts.clear();
         // Fail all queued client requests; discard internal sync entries.
         while let Some(q) = self.pending_queue.pop_front() {
             if let Some(cid) = q.client_id {
@@ -1343,7 +1374,67 @@ impl Core {
                 "in_flight sync timeout, discarding"
             );
         }
+        self.remember_ghost(f);
         self.advance_queue().await;
+    }
+
+    /// Keep track of the reply the radio still owes a command we failed.
+    fn remember_ghost(&mut self, f: InFlight) {
+        if self.ghosts.len() >= MAX_GHOSTS
+            && let Some(oldest) = self.ghosts.pop_front()
+        {
+            tracing::warn!(
+                cmd = format_args!("0x{:02x}", oldest.cmd_code),
+                "too many unanswered timed-out requests, forgetting the oldest"
+            );
+        }
+        self.ghosts.push_back(Ghost {
+            cmd_code: f.cmd_code(),
+            awaiting: f.awaiting,
+            since: Instant::now(),
+        });
+    }
+
+    /// Forget ghosts whose reply never came.
+    fn expire_ghosts(&mut self) {
+        while let Some(ghost) = self.ghosts.front()
+            && ghost.since.elapsed() >= GHOST_TTL
+        {
+            tracing::warn!(
+                cmd = format_args!("0x{:02x}", ghost.cmd_code),
+                "no reply ever came for a timed-out request"
+            );
+            self.ghosts.pop_front();
+        }
+    }
+
+    /// Swallow a frame that answers a command that already timed out.
+    /// Its client already got ERROR; the request now in flight keeps
+    /// waiting for its own reply, which comes next. Returns true if the
+    /// frame was claimed.
+    fn try_claim_ghost(&mut self, code: u8, payload: &[u8]) -> bool {
+        let Some(ghost) = self.ghosts.front() else {
+            return false;
+        };
+        let (matched, terminator) = ghost.awaiting.classify(code);
+        if !matched {
+            return false;
+        }
+        tracing::warn!(
+            cmd = format_args!("0x{:02x}", ghost.cmd_code),
+            reply = format_args!("0x{code:02x}"),
+            late_ms = ghost.since.elapsed().as_millis() as u64,
+            "dropping the late reply to a timed-out request"
+        );
+        if terminator {
+            self.ghosts.pop_front();
+        }
+        // A timed-out GET_MSG still popped the message off the radio, which
+        // hands it out only once: give it to everybody (already stored).
+        if matches!(code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
+            let _ = self.broadcast_tx.send(payload.to_vec());
+        }
+        true
     }
 
     fn protocol_version(&self, client_id: &ClientId) -> u8 {
@@ -1508,16 +1599,22 @@ impl Core {
             let _ = self.state.insert_raw_rx(resp_code, &payload).await;
         }
 
-        // 1. If the frame completes (or belongs to) the in_flight request,
+        // 1. The owed reply of a request that already timed out belongs to
+        //    nobody: the radio answers in order, so it comes before the
+        //    answer to whatever is in flight now.
+        if self.try_claim_ghost(resp_code, &payload) {
+            return;
+        }
+        // 2. If the frame completes (or belongs to) the in_flight request,
         //    route it to that client.
         if self.try_route_to_in_flight(resp_code, &payload).await {
             return;
         }
-        // 2. If it's a late ACK matching a previous MSG_SENT, route it.
+        // 3. If it's a late ACK matching a previous MSG_SENT, route it.
         if self.try_route_ack(resp_code, &payload) {
             return;
         }
-        // 3. A push event from the radio (MESSAGES_WAITING, ADVERTISEMENT,
+        // 4. A push event from the radio (MESSAGES_WAITING, ADVERTISEMENT,
         //    NEW_ADVERT, ...) goes to everybody.
         if is_push_event(resp_code) {
             // ADVERT / PATH_UPDATE: [code, pubkey(32)] for a contact the
@@ -1534,16 +1631,16 @@ impl Core {
             }
             return;
         }
-        // 4. A message frame no request claimed (e.g. the late reply to a
-        //    GET_MSG that already timed out). The radio pops each message
+        // 5. A message frame no request claimed (e.g. the late reply to a
+        //    GET_MSG whose ghost already expired). The radio pops each message
         //    from its queue only once, so dropping it would lose it for
         //    everybody: broadcast it like any inbound traffic.
         if matches!(resp_code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
             let _ = self.broadcast_tx.send(payload);
             return;
         }
-        // 5. Any other reply nobody is waiting for: typically the late answer
-        //    to a request that already timed out. Handing it to the clients
+        // 6. Any other reply nobody is waiting for: typically the late answer
+        //    to a request whose ghost already expired. Handing it to clients
         //    would only make them take it as the reply to something else.
         tracing::warn!(
             code = format_args!("0x{resp_code:02x}"),
@@ -1566,6 +1663,16 @@ impl Core {
 
         let client_id = in_flight.client_id;
         let cmd_code = in_flight.cmd_code();
+
+        let elapsed = in_flight.last_activity.elapsed();
+        if elapsed >= SLOW_REPLY_WARN {
+            tracing::warn!(
+                cmd = format_args!("0x{cmd_code:02x}"),
+                reply = format_args!("0x{code:02x}"),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow reply from the radio"
+            );
+        }
 
         if let Some(cid) = client_id {
             // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
