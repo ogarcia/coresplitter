@@ -625,6 +625,55 @@ async def test_late_reply_not_misrouted(proxy_port):
     await c2.close()
 
 
+async def test_unconfirmed_message_resent(proxy_port):
+    log.info("--- Test 21: A message the client never confirmed is sent again ---")
+    a = await connect_client(port=proxy_port)
+    b = await connect_client(port=proxy_port)
+    if not await a.appstart("ack-app") or not await b.appstart():
+        fail("SELF_INFO failed for one or both clients")
+        await a.close()
+        await b.close()
+        return
+    await _drain_all(a)
+
+    # a gets the echo but says nothing afterwards, like a phone that drops
+    # off the WiFi: nothing proves it read the message.
+    await b.send_chan_msg(0, "did you read this")
+    got = False
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await a.recv(1)
+        if p and b"did you read this" in p:
+            got = True
+            break
+    await asyncio.sleep(0.5)  # connected but silent, then gone
+    await b.close()
+    await a.close()
+    if not got:
+        fail("a did not receive the echo")
+        return
+    await asyncio.sleep(1.5)  # let the proxy notice and flush cursors
+
+    a = await connect_client(port=proxy_port)
+    await a.appstart("ack-app")
+    if await _drain_for_text(a, b"did you read this"):
+        ok("unconfirmed message is sent again on reconnect")
+    else:
+        fail("unconfirmed message was taken as delivered")
+    await _drain_all(a)
+    await a.close()
+    await asyncio.sleep(1.5)
+
+    # Confirmed this time (the client polled after it): not sent again.
+    a = await connect_client(port=proxy_port)
+    await a.appstart("ack-app")
+    if await _drain_for_text(a, b"did you read this", polls=3):
+        fail("confirmed message sent again")
+    else:
+        ok("confirmed message is not sent again")
+    await a.close()
+
+
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
     log.info("--- Test 17: TCP disconnection + reconnection ---")
@@ -1078,6 +1127,15 @@ async def _drain_for_text(c, text: bytes, polls: int = 5):
     return None
 
 
+async def _drain_all(c, polls: int = 20):
+    """Poll GET_MSG until NO_MORE_MSGS, as an app does after a sync. That
+    last poll is what confirms the messages before it were read."""
+    for _ in range(polls):
+        p = await c.get_message()
+        if not p or p[0] == 0x0A:
+            return
+
+
 async def test_missed_messages_replayed(proxy_port):
     log.info("--- Test 14: Missed messages replayed on reconnect ---")
     a = await connect_client(port=proxy_port)
@@ -1102,6 +1160,7 @@ async def test_missed_messages_replayed(proxy_port):
         ok("reconnecting client gets the message it missed via GET_MSG")
     else:
         fail("missed message was not replayed on reconnect")
+    await _drain_all(a)
 
     # Caught up now: reconnecting again must not replay it a second time.
     await a.close()
@@ -1266,6 +1325,7 @@ async def main():
     await test_resend_echoed_once(proxy_port)
     await test_drain_while_offline(proxy_port, DATA_DIR)
     await test_late_reply_not_misrouted(proxy_port)
+    await test_unconfirmed_message_resent(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL

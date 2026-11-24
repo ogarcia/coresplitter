@@ -182,6 +182,15 @@ struct Session {
     /// before the radio is asked. While non-empty its cursor advances
     /// only as these are delivered.
     pending: VecDeque<i64>,
+    /// Highest message id written to this client, replayed or live.
+    /// Written into the socket, not necessarily read: see `confirmed`.
+    sent: i64,
+    /// `sent` as of the client's latest command. TCP delivers in order, so
+    /// a command proves the client read everything written before it. This,
+    /// not `sent`, is what goes into its cursor.
+    confirmed: i64,
+    /// Highest cursor already persisted for this session.
+    flushed: i64,
 }
 
 #[derive(Debug)]
@@ -455,6 +464,7 @@ impl Core {
                 _ = timeout_tick.tick() => {
                     self.check_in_flight_timeout().await;
                     self.expire_ghosts();
+                    self.flush_client_cursors().await;
                 }
                 _ = maintenance_tick.tick() => {
                     self.run_maintenance().await;
@@ -501,6 +511,7 @@ impl Core {
 
     async fn shutdown(&mut self) {
         tracing::info!("shutting down multiplexer");
+        self.flush_client_cursors().await;
 
         self.radio_send_tx = None;
         let (_, dummy_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -822,6 +833,12 @@ impl Core {
         let cmd_code = cmd.payload[0];
         self.log_event("->", cmd_code, &cmd.payload);
 
+        // The client just spoke, so it read everything written to it
+        // before this command (see `flush_client_cursors`).
+        if let Some(session) = self.sessions.get_mut(&cmd.client_id) {
+            session.confirmed = session.sent;
+        }
+
         if cmd_code == 0x01 {
             self.register_session(&cmd).await;
         }
@@ -1112,6 +1129,9 @@ impl Core {
             .unwrap_or_default();
         let port = cmd.local_port;
 
+        // A previous session of this identity may have confirmed messages
+        // that are not persisted yet: a quick reconnect must not get them.
+        self.flush_client_cursors().await;
         let pending = match self.state.client_cursor(port, &app_name).await {
             Ok(Some(cursor)) => self.state.message_ids_after(cursor, port, &app_name).await,
             Ok(None) => {
@@ -1157,6 +1177,9 @@ impl Core {
                 port,
                 app_name,
                 pending,
+                sent: cursor,
+                confirmed: cursor,
+                flushed: cursor,
             },
         );
     }
@@ -1176,10 +1199,9 @@ impl Core {
     /// Answer a GET_MSG with the next message the client missed. Returns
     /// false when there is none left, so the radio is asked instead.
     async fn replay_next_missed(&mut self, client_id: &ClientId) -> bool {
-        let Some(session) = self.sessions.get(client_id) else {
+        if !self.sessions.contains_key(client_id) {
             return false;
-        };
-        let (port, app_name) = (session.port, session.app_name.clone());
+        }
         let mut served = false;
         while let Some(id) = self
             .sessions
@@ -1191,21 +1213,22 @@ impl Core {
                 continue;
             };
             self.send_to_client(client_id, frame);
-            let _ = self.state.advance_client_cursor(port, &app_name, id).await;
+            if let Some(session) = self.sessions.get_mut(client_id) {
+                session.sent = id;
+            }
             served = true;
             break;
         }
-        // Caught up: from now on the cursor follows live traffic.
+        // Caught up: from now on the cursor follows live traffic, which
+        // was being sent to this client during the replay as well.
         if self
             .sessions
             .get(client_id)
             .is_some_and(|s| s.pending.is_empty())
             && let Ok(head) = self.state.message_head().await
+            && let Some(session) = self.sessions.get_mut(client_id)
         {
-            let _ = self
-                .state
-                .advance_client_cursor(port, &app_name, head)
-                .await;
+            session.sent = session.sent.max(head);
         }
         served
     }
@@ -1220,25 +1243,63 @@ impl Core {
         Ok(())
     }
 
+    /// Note that every connected, caught-up client was sent message `id`.
+    /// Only in memory: it is persisted once the client proves it read it.
     async fn follow_head(&mut self, id: i64) {
-        let mut identities: Vec<(u16, String)> = {
-            let channels = self.client_channels.lock().unwrap();
-            self.sessions.retain(|cid, _| channels.contains_key(cid));
-            self.protocol_versions
-                .retain(|cid, _| channels.contains_key(cid));
-            self.sessions
-                .values()
-                .filter(|s| s.pending.is_empty())
-                .map(|s| (s.port, s.app_name.clone()))
-                .collect()
-        };
-        identities.sort();
-        identities.dedup();
-        for (port, app_name) in identities {
-            if let Err(e) = self.state.advance_client_cursor(port, &app_name, id).await {
-                tracing::warn!(error = %e, "failed to advance client cursor");
+        let channels = self.client_channels.lock().unwrap();
+        for (cid, session) in self.sessions.iter_mut() {
+            if session.pending.is_empty() && channels.contains_key(cid) {
+                session.sent = session.sent.max(id);
             }
         }
+    }
+
+    /// Persist each client's cursor up to what it confirmed; runs every
+    /// second.
+    ///
+    /// A message written to a client is not one it read. A phone that
+    /// leaves the WiFi or sleeps without closing the connection leaves a
+    /// half-open socket behind, where writes keep succeeding into the
+    /// kernel buffer for minutes. Persisting what was written would mark
+    /// those messages as delivered and the app would never get them. So
+    /// the cursor only moves up to the client's last command, also once it
+    /// is gone: whatever reached it after that is sent again on its next
+    /// connection. A duplicate is the acceptable side of that ambiguity, a
+    /// lost message is not.
+    async fn flush_client_cursors(&mut self) {
+        let cursors: Vec<(ClientId, u16, String, i64, bool)> = {
+            let channels = self.client_channels.lock().unwrap();
+            self.sessions
+                .iter()
+                .filter(|(cid, s)| s.confirmed > s.flushed || !channels.contains_key(cid))
+                .map(|(cid, s)| {
+                    let alive = channels.contains_key(cid);
+                    (*cid, s.port, s.app_name.clone(), s.confirmed, alive)
+                })
+                .collect()
+        };
+        for (cid, port, app_name, confirmed, alive) in cursors {
+            let flushed = self.sessions.get(&cid).map_or(i64::MAX, |s| s.flushed);
+            if confirmed > flushed {
+                if let Err(e) = self
+                    .state
+                    .advance_client_cursor(port, &app_name, confirmed)
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to advance client cursor");
+                    continue;
+                }
+                if let Some(session) = self.sessions.get_mut(&cid) {
+                    session.flushed = confirmed;
+                }
+            }
+            if !alive {
+                self.sessions.remove(&cid);
+            }
+        }
+        let channels = self.client_channels.lock().unwrap();
+        self.protocol_versions
+            .retain(|cid, _| channels.contains_key(cid));
     }
 
     fn client_is_alive(&self, client_id: &ClientId) -> bool {

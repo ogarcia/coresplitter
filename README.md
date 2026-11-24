@@ -92,6 +92,18 @@ which does the same for Meshtastic.
    official app) look identical on one port; give each its own port
    with `--tcp-frontend-port 5000,5001`. What a never-seen client gets
    is set with `CORESPLITTER_NEW_CLIENT_BACKLOG`.
+
+   A message counts as delivered only once the client sends a command
+   after it: TCP delivers in order, so that proves the client read it.
+   Just writing it to the connection proves nothing. A phone that drops
+   off the WiFi or goes to sleep can leave a half-open connection that
+   keeps accepting writes for minutes, and those messages would be lost
+   for good. The flip side: what a client receives after its last
+   command (usually nothing or one message; at most the traffic of the
+   last few minutes if the app stayed silent) is sent again on its next
+   connection. **If an app shows a duplicate right after reconnecting,
+   this is the likely cause**: the copy arrived after the app's last
+   command, and the proxy could not tell whether it was read.
 8. Nobody connected: the radio only keeps 16 incoming messages until a
    client fetches them, and when full it starts dropping them. While no
    client is connected the proxy fetches them itself, on every
@@ -304,6 +316,7 @@ runs the tests, and cleans up.
 | 18 | Resent message echoed once | A SEND_CHAN_MSG retried with the same timestamp reaches the other client only once |
 | 19 | Radio queue fetched while offline | With no client connected the proxy fetches and stores the radio's messages; the app gets them when it reconnects |
 | 20 | Late reply not misrouted | A GET_CONTACT_BY_KEY the radio answers after the in-flight timeout gets ERROR, and its late reply does not reach the request queued behind it |
+| 21 | Unconfirmed message sent again | A client that gets a message and disconnects without sending another command gets it again on reconnect; once confirmed it is not sent again |
 
 ### Fake radio
 
